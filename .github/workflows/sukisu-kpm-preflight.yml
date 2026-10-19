@@ -1,0 +1,123 @@
+name: SukiSU KPM ARM64 preflight
+
+on:
+  push:
+    paths:
+      - "selinux_hook/**"
+      - "KernelPatch"
+      - "tools/**"
+      - "docs/sukisu-4.19.md"
+      - ".github/workflows/sukisu-kpm-preflight.yml"
+  workflow_dispatch:
+
+# A new SukiSU build supersedes older builds of this branch.
+# Same group as legacy Build CI to avoid competing build jobs.
+concurrency:
+  group: kpm-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+    steps:
+      # Older queued runs were created before the concurrency rule existed.
+      # They cannot be canceled until this job has received a runner.
+      - name: Cancel obsolete KPM runs on this branch
+        if: github.ref == 'refs/heads/sukisu-4.19-build-preflight'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const currentId = Number(context.runId);
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo,
+              branch: 'sukisu-4.19-build-preflight',
+              per_page: 100
+            });
+            const active = new Set(['queued', 'pending', 'requested', 'waiting', 'in_progress']);
+            const managed = new Set(['Build CI', 'SukiSU KPM ARM64 preflight']);
+            const obsolete = runs.filter(run =>
+              run.id < currentId && active.has(run.status) && managed.has(run.name)
+            );
+            core.info(`Found ${obsolete.length} older active KPM runs to cancel`);
+            for (const run of obsolete) {
+              try {
+                await github.rest.actions.cancelWorkflowRun({owner, repo, run_id: run.id});
+                core.info(`Cancellation requested for ${run.id}: ${run.name}`);
+              } catch (error) {
+                core.warning(`Could not cancel ${run.id}: ${error.message}`);
+              }
+            }
+
+      - name: Checkout exact source and pinned KernelPatch submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install cross toolchain and compiler cache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu make file ccache
+          ccache --max-size=256M
+
+      - name: Restore compiler object cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: sukisu-kpm-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            sukisu-kpm-ccache-${{ runner.os }}-${{ github.ref_name }}-
+            sukisu-kpm-ccache-${{ runner.os }}-
+
+      - name: Check required headers and compiler
+        run: |
+          test -f KernelPatch/kernel/include/kpmodule.h
+          test -f selinux_hook/selinux_hook.c
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Compile SukiSU test KPM
+        run: |
+          make -C selinux_hook clean
+          make -C selinux_hook -j2 TARGET_COMPILE=aarch64-linux-gnu- CC="ccache aarch64-linux-gnu-gcc"
+          ccache --show-stats
+
+      - name: Check AArch64 ELF and collect link requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          module=$(find selinux_hook -maxdepth 1 -name '*.kpm' -type f -print -quit)
+          test -n "$module"
+          file "$module" | tee reports/file.txt
+          aarch64-linux-gnu-readelf -h "$module" | tee reports/elf-header.txt
+          aarch64-linux-gnu-readelf -Ws "$module" > reports/symbols.txt
+          awk '$7=="UND" {print $8}' reports/symbols.txt | sort -u > reports/undefined-symbols.txt
+          grep -q 'AArch64' reports/elf-header.txt
+          grep -q 'REL (Relocatable file)' reports/elf-header.txt
+          sha256sum "$module" | tee reports/sha256.txt
+          {
+            echo "source_commit=$GITHUB_SHA"
+            echo "kernelpatch_gitlink=$(git rev-parse HEAD:KernelPatch)"
+            echo "compiler=$(aarch64-linux-gnu-gcc -dumpfullversion)"
+            echo "NOTE=ELF checks do not prove SukiSU runtime compatibility"
+            echo "NOTE=Do not embed or flash without device-specific boot/recovery plan"
+          } > reports/build-info.txt
+
+      - name: Publish KPM and compatibility reports (not a release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-kpm-arm64-unverified
+          path: |
+            selinux_hook/*.kpm
+            reports/*
+          if-no-files-found: error
+          retention-days: 7

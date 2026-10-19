@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t4"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t4");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -497,6 +497,8 @@ static bool g_policydb_offset_fallback_warned;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
+/* Diagnostic-only, capped counter for K40 policy probe monitoring. */
+static u32 g_k40_policy_probe_count;
 static bool g_simple_read_from_buffer_hooked;
 static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
@@ -602,6 +604,8 @@ static void uninstall_write_op_hooks(void);
 static void uninstall_inline_hooks(void);
 static bool event_is_post_init(const char *event);
 static void try_complete_deferred_write_op_install(const char *reason);
+/* SukiSU embedded KPM can initialize before selinuxfs exists. */
+static void sc_install(void);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
@@ -842,6 +846,24 @@ static bool selinux_49_compat_path(void)
 static bool selinux_414_compat_path(void)
 {
     return kver < VERSION(4, 15, 0);
+}
+
+/*
+ * Isolated K40 experiment: turn on the DirtySepolicy query filter for
+ * 4.19.157, without lying to other code about the kernel ABI.
+ *
+ * In particular, write_op_slot_fallback_allowed() must continue to use
+ * selinux_414_compat_path() so that 4.19 keeps its own fallback behavior.
+ *
+ * NOTE: This filters SELinux query results; it does NOT remove live grants.
+ */
+static bool dirtysepolicy_probe_gate_enabled(void)
+{
+#if defined(K40_TEST_DIRTYSEPOLICY_GATE) && K40_TEST_DIRTYSEPOLICY_GATE
+    if (kver == VERSION(4, 19, 157))
+        return true;
+#endif
+    return selinux_414_compat_path();
 }
 
 static bool clean_policydb_redirect_supported(void)
@@ -2302,7 +2324,7 @@ static bool context_token_matches(const char *query, const char *lit)
 
 static bool dirtysepolicy_context_should_hide(const char *query)
 {
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_probe_gate_enabled())
         return false;
 
     /*
@@ -2472,7 +2494,7 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     const char *src;
     const char *dst;
 
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_probe_gate_enabled())
         return false;
     if (!query || !len)
         return false;
@@ -2821,6 +2843,8 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
     selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
     snapshot_clean_policy("complete_init");
     try_complete_deferred_write_op_install("complete_init");
+    /* Retry syscall-layer installation after early embedded KPM init. */
+    sc_install();
 }
 
 /* Hook: selinux_policy_commit */
@@ -2850,6 +2874,8 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
     try_complete_deferred_write_op_install("policy_commit");
+    /* Retry once SELinux commits a policy; early selinuxfs may be absent. */
+    sc_install();
 }
 
 /*
@@ -2863,22 +2889,22 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
  */
 static bool event_is_post_init(const char *event)
 {
-    const char * const pre = "pre-kernel-init";
-    const char *p = pre;
-
+    /*
+     * Embedded KPMs may be invoked at several KernelPatch early-boot events.
+     * These events do not guarantee that selinux_complete_init() has run.
+     * Reuse the local bytewise string comparator (no libc strcmp in KPM).
+     *
+     * A NULL event retains upstream behavior for explicitly loaded KPMs;
+     * the SELinux-ready callback still retries the deferred hook separately.
+     */
     if (!event)
         return true;
-    /*
-     * Compare byte-by-byte against "pre-kernel-init" without invoking the
-     * out-of-line strcmp() libcall, which is unavailable in the KPM loader.
-     */
-    while (*p && *event && *p == *event) {
-        p++;
-        event++;
-    }
-    if (*p == '\0' && *event == '\0')
-        return false;
-    return true;
+
+    return !(str_eq_lit(event, "paging-init") ||
+             str_eq_lit(event, "pre-kernel-init") ||
+             str_eq_lit(event, "post-kernel-init") ||
+             str_eq_lit(event, "pre-init-first-stage") ||
+             str_eq_lit(event, "pre-exec-init"));
 }
 
 /*
@@ -3067,6 +3093,27 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
+
+    /*
+     * 4.19 diagnostic: determine whether policy-query hooks are entered,
+     * whether the caller bypasses them, and whether a clean snapshot exists.
+     * Logging only; no SELinux decision or return value is changed.
+     */
+    if (sample_len &&
+        (access_contexts_match(sample, "u:r:system_server:s0", "u:r:system_server:s0") ||
+         access_contexts_match(sample, "u:r:zygote:s0", "u:object_r:adb_data_file:s0"))) {
+        u32 probe = READ_ONCE(g_k40_policy_probe_count) + 1;
+
+        WRITE_ONCE(g_k40_policy_probe_count, probe);
+        if (probe <= 24)
+            pr_info("[selinux_hook] K40 POLICY PROBE #%u uid=%u comm=%s bypass=%d legacy_gate=%d clean_pdb=%d clean_blob=%d selinux_ready=%d query=\"%s\"\n",
+                    probe, uid, current_comm(),
+                    should_bypass_clean_filter(uid) ? 1 : 0,
+                    selinux_414_compat_path() ? 1 : 0,
+                    READ_ONCE(g_clean_policydb) ? 1 : 0,
+                    READ_ONCE(g_clean_policy_blob) ? 1 : 0,
+                    READ_ONCE(g_selinux_ready) ? 1 : 0, sample);
+    }
 
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
@@ -4428,20 +4475,32 @@ static void before_sys_write(hook_fargs3_t *a, void *u)
 
 static void sc_install(void)
 {
-    sc_fget_fn = (void *(*)(unsigned int))lookup_name_optional_suffix("fget");
-    sc_fput_fn = (void (*)(void *))lookup_name_optional_suffix("fput");
+    /*
+     * Idempotent: called at KPM init and again after SELinux initialization.
+     * SukiSU embedded modules may run before /sys/fs/selinux is mounted.
+     */
+    if (sc_hooked)
+        return;
 
-    if (!sc_fget_fn || !sc_fput_fn) {
-        pr_warn("[selinux_hook] SC fget/fput unresolved, syscall layer disabled\n");
+    if (!filp_open_fn || !filp_close_fn) {
+        pr_warn("[selinux_hook] SC filp_open/filp_close unavailable; defer syscall layer\n");
         return;
     }
+
+    sc_fget_fn = (void *(*)(unsigned int))lookup_name_optional_suffix("fget");
+    sc_fput_fn = (void (*)(void *))lookup_name_optional_suffix("fput");
+    if (!sc_fget_fn || !sc_fput_fn) {
+        pr_warn("[selinux_hook] SC fget/fput unresolved; will retry when SELinux is ready\n");
+        return;
+    }
+
     if (!sc_cache_fop()) {
-        pr_warn("[selinux_hook] SC selinuxfs fop unavailable, syscall layer disabled\n");
+        pr_info("[selinux_hook] SC selinuxfs not mounted yet; defer until SELinux ready\n");
         return;
     }
 
     if (fp_hook_syscalln(__NR_write, 3, before_sys_write, NULL, NULL)) {
-        pr_warn("[selinux_hook] SC fp_hook_syscalln(write) failed, syscall layer disabled\n");
+        pr_warn("[selinux_hook] SC fp_hook_syscalln(write) failed; syscall layer unavailable\n");
         return;
     }
 
@@ -4470,9 +4529,16 @@ static long init(const char *args, const char *event, void *__user r)
                      (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
+    pr_info("[selinux_hook] K40 CHANNEL CHECK: status_seq=%u status_policyload=%u access_seq_override=1 policydb_seq_override=%u (diagnostic only)\n",
+            get_u32_le(g_clean_status_bytes + 4),
+            get_u32_le(g_clean_status_bytes + 12),
+            SELINUX_STATUS_CLEAN_SEQUENCE);
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
+    pr_info("[selinux_hook] K40 test gate dirtysepolicy=%d legacy_abi=%d kver=%x\n",
+            dirtysepolicy_probe_gate_enabled() ? 1 : 0,
+            selinux_414_compat_path() ? 1 : 0, kver);
     resolve_required_symbols_once();
 
     /* Raw spinlock helpers — kfunc wrappers are not exported on this kernel,
@@ -4593,12 +4659,19 @@ static long init(const char *args, const char *event, void *__user r)
         if (!selinux_49_compat_path()) {
             int argc = selinux_state_arg_required() ? 3 : 2;
 
-            g_funcs[g_hooks++] = (void *)security_read_policy_fn;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
             if (selinux_state_arg_required())
-                hook_wrap((void *)security_read_policy_fn, 3, before_security_read_policy_compat, NULL, NULL);
+                hrc = hook_wrap((void *)security_read_policy_fn, 3,
+                                before_security_read_policy_compat, NULL, NULL);
             else
-                hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
+                hrc = hook_wrap((void *)security_read_policy_fn, 2,
+                                before_security_read_policy, NULL, NULL);
+            if (hrc) {
+                pr_warn("[selinux_hook] hook security_read_policy failed rc=%d; policy read remains live\n", hrc);
+            } else {
+                g_funcs[g_hooks++] = (void *)security_read_policy_fn;
+            }
         } else {
             pr_info("[selinux_hook] skip security_read_policy hook on 4.9: helper ABI is device-specific\n");
         }
@@ -4606,21 +4679,33 @@ static long init(const char *args, const char *event, void *__user r)
 
     addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
-        WRITE_ONCE(g_simple_read_from_buffer_hooked, true);
-        selinux_hook_dbg("[selinux_hook] hook simple_read_from_buffer argc=5 for status patch\n");
-        hook_wrap((void *)addr, 5, before_simple_read_from_buffer,
-                  after_simple_read_from_buffer, NULL);
+        hook_err_t hrc;
+        hrc = hook_wrap((void *)addr, 5, before_simple_read_from_buffer,
+                        after_simple_read_from_buffer, NULL);
+        if (hrc) {
+            WRITE_ONCE(g_simple_read_from_buffer_hooked, false);
+            pr_warn("[selinux_hook] hook simple_read_from_buffer failed rc=%d; status direct-copy fallback active\n", hrc);
+        } else {
+            g_funcs[g_hooks++] = (void *)addr;
+            WRITE_ONCE(g_simple_read_from_buffer_hooked, true);
+            selinux_hook_dbg("[selinux_hook] hook simple_read_from_buffer argc=5 installed\n");
+        }
     } else {
         pr_warn("[selinux_hook] cannot find simple_read_from_buffer, status hook will use direct user copy fallback\n");
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
     if (addr) {
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4\n");
-        hook_wrap((void *)addr, 4, before_sel_read_handle_status,
-                  after_sel_read_handle_status, NULL);
+        hrc = hook_wrap((void *)addr, 4, before_sel_read_handle_status,
+                        after_sel_read_handle_status, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook sel_read_handle_status failed rc=%d\n", hrc);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4 installed\n");
+        }
     } else {
         pr_warn("[selinux_hook] cannot find sel_read_handle_status, status read hook skipped\n");
     }
@@ -4628,9 +4713,15 @@ static long init(const char *args, const char *event, void *__user r)
     /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
     addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
     if (addr) {
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
-        hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
+        hrc = hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook sel_mmap_handle_status failed rc=%d\n", hrc);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2 installed\n");
+        }
     } else {
         pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
     }
@@ -4640,9 +4731,15 @@ static long init(const char *args, const char *event, void *__user r)
     if (addr) {
         /* argc=1 on < 5.19 (state arg), argc=0 on >= 5.19 */
         int argc = (kver < VERSION(5, 19, 0)) ? 1 : 0;
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_seqlock argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_seqlock, NULL, NULL);
+        hrc = hook_wrap((void *)addr, argc, before_selinux_status_update_seqlock, NULL, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook selinux_status_update_seqlock failed rc=%d kver=%x\n", hrc, kver);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook selinux_status_update_seqlock argc=%d kver=%x installed\n", argc, kver);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_status_update_seqlock\n");
     }
@@ -4651,9 +4748,15 @@ static long init(const char *args, const char *event, void *__user r)
     if (addr) {
         /* argc=2 on < 5.19 (state, seqno), argc=1 on >= 5.19 (seqno) */
         int argc = (kver < VERSION(5, 19, 0)) ? 2 : 1;
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_policyload argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_policyload, NULL, NULL);
+        hrc = hook_wrap((void *)addr, argc, before_selinux_status_update_policyload, NULL, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook selinux_status_update_policyload failed rc=%d kver=%x\n", hrc, kver);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook selinux_status_update_policyload argc=%d kver=%x installed\n", argc, kver);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_status_update_policyload\n");
     }
@@ -4725,14 +4828,22 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip context_struct_compute_av on 4.9: helper ABI is device-specific\n");
         } else if (clean_policydb_redirect_supported()) {
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
-            hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
-                      after_context_struct_compute_av_policydb, NULL);
+            hrc = hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
+                            after_context_struct_compute_av_policydb, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook context_struct_compute_av failed rc=%d; clean policydb redirect unavailable\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
-            hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
+            hrc = hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook legacy context_struct_compute_av failed rc=%d\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         }
     } else {
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
@@ -4758,9 +4869,13 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip selinux_complete_init on 4.9: helper ABI is device-specific\n");
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook selinux_complete_init argc=0\n");
-            hook_wrap((void *)addr, 0, NULL, after_selinux_complete_init, NULL);
+            hrc = hook_wrap((void *)addr, 0, NULL, after_selinux_complete_init, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook selinux_complete_init failed rc=%d; deferred initialization may not run\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_complete_init\n");
@@ -4773,10 +4888,14 @@ static long init(const char *args, const char *event, void *__user r)
         } else {
             int argc = selinux_state_arg_required() ? 2 : 1;
 
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook selinux_policy_commit argc=%d mode=%s\n",
                     argc, selinux_state_arg_required() ? "state+load_state" : "load_state");
-            hook_wrap((void *)addr, argc, NULL, after_selinux_policy_commit, NULL);
+            hrc = hook_wrap((void *)addr, argc, NULL, after_selinux_policy_commit, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook selinux_policy_commit failed rc=%d; clean policy refresh unavailable\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_policy_commit\n");

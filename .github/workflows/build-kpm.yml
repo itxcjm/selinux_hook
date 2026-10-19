@@ -1,11 +1,7 @@
 name: Build CI
 
+# Legacy build remains available manually, but does not double-build on every push.
 on:
-  push:
-    paths:
-      - ".github/workflows/build-kpm.yml"
-      - "**.c"
-
   workflow_dispatch:
     inputs:
       release:
@@ -16,6 +12,11 @@ on:
         description: 'release version'
         required: false
         default: '2024051900'
+
+# Share build concurrency with the SukiSU preflight workflow.
+concurrency:
+  group: kpm-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   Build-on-Ubuntu:
@@ -32,14 +33,34 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 1
 
-      - name: Update system and install dependencies
-        run: |
-          sudo apt update -y
+      - name: Restore GCC cross-toolchain from cache
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf
+          key: toolchain-aarch64-none-elf-12.2.rel1-ubuntu-x64-v1
 
-      - name: Install Compiler
+      - name: Install Compiler (cache miss only)
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
-          curl -o arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
-          tar -Jxf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          curl -fL --retry 3 -o toolchain.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -Jxf toolchain.tar.xz
+          rm -f toolchain.tar.xz
+
+      - name: Restore compiler object cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: legacy-kpm-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            legacy-kpm-ccache-${{ runner.os }}-${{ github.ref_name }}-
+            legacy-kpm-ccache-${{ runner.os }}-
+
+      - name: Install ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          ccache --max-size=256M
 
       - name: Build kpm
         env:
@@ -47,10 +68,12 @@ jobs:
         run: |
           mkdir target
 
-          for dir in $(ls -d */ | grep -v '^KernelPatch/$\|^target/$\|^arm-gnu-toolchain'); do
-            make -C ${dir}
-            mv ${dir}*.kpm target
-          done
+          make -C selinux_hook CC="ccache ${TARGET_COMPILE}gcc"
+          mv selinux_hook/*.kpm target/
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true
 
       - name: Upload artifact
         if: success()
