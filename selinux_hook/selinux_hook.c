@@ -4635,10 +4635,16 @@ static long init(const char *args, const char *event, void *__user r)
 
     addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
     if (addr) {
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4\n");
-        hook_wrap((void *)addr, 4, before_sel_read_handle_status,
-                  after_sel_read_handle_status, NULL);
+        hrc = hook_wrap((void *)addr, 4, before_sel_read_handle_status,
+                        after_sel_read_handle_status, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook sel_read_handle_status failed rc=%d\n", hrc);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4 installed\n");
+        }
     } else {
         pr_warn("[selinux_hook] cannot find sel_read_handle_status, status read hook skipped\n");
     }
@@ -4646,9 +4652,15 @@ static long init(const char *args, const char *event, void *__user r)
     /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
     addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
     if (addr) {
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
-        hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
+        hrc = hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook sel_mmap_handle_status failed rc=%d\n", hrc);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2 installed\n");
+        }
     } else {
         pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
     }
@@ -4658,9 +4670,15 @@ static long init(const char *args, const char *event, void *__user r)
     if (addr) {
         /* argc=1 on < 5.19 (state arg), argc=0 on >= 5.19 */
         int argc = (kver < VERSION(5, 19, 0)) ? 1 : 0;
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_seqlock argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_seqlock, NULL, NULL);
+        hrc = hook_wrap((void *)addr, argc, before_selinux_status_update_seqlock, NULL, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook selinux_status_update_seqlock failed rc=%d kver=%x\n", hrc, kver);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook selinux_status_update_seqlock argc=%d kver=%x installed\n", argc, kver);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_status_update_seqlock\n");
     }
@@ -4669,9 +4687,15 @@ static long init(const char *args, const char *event, void *__user r)
     if (addr) {
         /* argc=2 on < 5.19 (state, seqno), argc=1 on >= 5.19 (seqno) */
         int argc = (kver < VERSION(5, 19, 0)) ? 2 : 1;
+        hook_err_t hrc;
         g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_policyload argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_policyload, NULL, NULL);
+        hrc = hook_wrap((void *)addr, argc, before_selinux_status_update_policyload, NULL, NULL);
+        if (hrc) {
+            g_hooks--;
+            pr_warn("[selinux_hook] hook selinux_status_update_policyload failed rc=%d kver=%x\n", hrc, kver);
+        } else {
+            selinux_hook_dbg("[selinux_hook] hook selinux_status_update_policyload argc=%d kver=%x installed\n", argc, kver);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_status_update_policyload\n");
     }
