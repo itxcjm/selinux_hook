@@ -497,6 +497,8 @@ static bool g_policydb_offset_fallback_warned;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
+/* Diagnostic-only, capped counter for K40 policy probe monitoring. */
+static u32 g_k40_policy_probe_count;
 static bool g_simple_read_from_buffer_hooked;
 static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
@@ -3074,6 +3076,27 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
 
+    /*
+     * 4.19 diagnostic: determine whether policy-query hooks are entered,
+     * whether the caller bypasses them, and whether a clean snapshot exists.
+     * Logging only; no SELinux decision or return value is changed.
+     */
+    if (sample_len &&
+        (access_contexts_match(sample, "u:r:system_server:s0", "u:r:system_server:s0") ||
+         access_contexts_match(sample, "u:r:zygote:s0", "u:object_r:adb_data_file:s0"))) {
+        u32 probe = READ_ONCE(g_k40_policy_probe_count) + 1;
+
+        WRITE_ONCE(g_k40_policy_probe_count, probe);
+        if (probe <= 24)
+            pr_info("[selinux_hook] K40 POLICY PROBE #%u uid=%u comm=%s bypass=%d legacy_gate=%d clean_pdb=%d clean_blob=%d selinux_ready=%d query=\"%s\"\n",
+                    probe, uid, current_comm(),
+                    should_bypass_clean_filter(uid) ? 1 : 0,
+                    selinux_414_compat_path() ? 1 : 0,
+                    READ_ONCE(g_clean_policydb) ? 1 : 0,
+                    READ_ONCE(g_clean_policy_blob) ? 1 : 0,
+                    READ_ONCE(g_selinux_ready) ? 1 : 0, sample);
+    }
+
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("access", uid, sample);
@@ -4488,6 +4511,10 @@ static long init(const char *args, const char *event, void *__user r)
                      (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
+    pr_info("[selinux_hook] K40 CHANNEL CHECK: status_seq=%u status_policyload=%u access_seq_override=1 policydb_seq_override=%u (diagnostic only)\n",
+            get_u32_le(g_clean_status_bytes + 4),
+            get_u32_le(g_clean_status_bytes + 12),
+            SELINUX_STATUS_CLEAN_SEQUENCE);
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
