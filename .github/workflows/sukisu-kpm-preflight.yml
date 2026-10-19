@@ -1,0 +1,73 @@
+name: SukiSU KPM ARM64 preflight
+
+on:
+  push:
+    paths:
+      - "selinux_hook/**"
+      - "KernelPatch"
+      - "tools/**"
+      - "docs/sukisu-4.19.md"
+      - ".github/workflows/sukisu-kpm-preflight.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact source and pinned KernelPatch submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu make file
+
+      - name: Check required headers and compiler
+        run: |
+          test -f KernelPatch/kernel/include/kpmodule.h
+          test -f selinux_hook/selinux_hook.c
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Compile unmodified SELinux KPM code
+        run: |
+          make -C selinux_hook clean
+          make -C selinux_hook -j2 TARGET_COMPILE=aarch64-linux-gnu-
+
+      - name: Check AArch64 ELF and collect link requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          module=$(find selinux_hook -maxdepth 1 -name '*.kpm' -type f -print -quit)
+          test -n "$module"
+          file "$module" | tee reports/file.txt
+          aarch64-linux-gnu-readelf -h "$module" | tee reports/elf-header.txt
+          aarch64-linux-gnu-readelf -Ws "$module" > reports/symbols.txt
+          awk '$7=="UND" {print $8}' reports/symbols.txt | sort -u > reports/undefined-symbols.txt
+          grep -q 'AArch64' reports/elf-header.txt
+          grep -q 'REL (Relocatable file)' reports/elf-header.txt
+          sha256sum "$module" | tee reports/sha256.txt
+          {
+            echo "source_commit=$GITHUB_SHA"
+            echo "kernelpatch_gitlink=$(git rev-parse HEAD:KernelPatch)"
+            echo "compiler=$(aarch64-linux-gnu-gcc -dumpfullversion)"
+            echo "NOTE=ELF checks do not prove SukiSU runtime compatibility"
+            echo "NOTE=Do not embed or flash without device-specific boot/recovery plan"
+          } > reports/build-info.txt
+
+      - name: Publish KPM and compatibility reports (not a release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-kpm-arm64-unverified
+          path: |
+            selinux_hook/*.kpm
+            reports/*
+          if-no-files-found: error
+          retention-days: 7
