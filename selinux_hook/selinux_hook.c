@@ -3021,7 +3021,7 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
     if (!avd)
         return;
 
-    WRITE_ONCE(avd->seqno, SELINUX_STATUS_CLEAN_SEQUENCE);
+    WRITE_ONCE(avd->seqno, get_u32_le(g_clean_status_bytes + 4));
     WRITE_ONCE(avd->flags, (u32)a->local.data3);
 }
 
@@ -3048,7 +3048,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 
         if (context_struct_compute_av_intel(clean_pdb, scontext, tcontext,
                                             tclass, &clean_avd, xperms)) {
-            clean_avd.seqno = SELINUX_STATUS_CLEAN_SEQUENCE;
+            clean_avd.seqno = get_u32_le(g_clean_status_bytes + 4);
             clean_avd.flags = avd->flags;
             *avd = clean_avd;
             a->skip_origin = 1;
@@ -4125,8 +4125,8 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
                 (void *)a->arg1, (size_t)a->arg2, (void *)a->arg3,
                 pos_before, ret, pos_after, g_copy_to_user_name ?: "compat_copy_to_user",
                 SELINUX_KERNEL_STATUS_VERSION,
-                SELINUX_STATUS_CLEAN_SEQUENCE,
-                SELINUX_STATUS_CLEAN_POLICYLOAD);
+                get_u32_le(g_clean_status_bytes + 4),
+                get_u32_le(g_clean_status_bytes + 12));
 
     if (ret < 0)
         return;
@@ -4138,8 +4138,8 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
     a->ret = (uint64_t)ret;
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%d comm=%s ret=%zd sequence=%u policyload=%u copy=%s\n",
                      n, uid, current_comm(), ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD,
+                     get_u32_le(g_clean_status_bytes + 4),
+                     get_u32_le(g_clean_status_bytes + 12),
                      g_copy_to_user_name ?: "compat_copy_to_user");
 }
 
@@ -4178,8 +4178,8 @@ static void after_sel_read_handle_status(hook_fargs4_t *a, void *u)
     WRITE_ONCE(g_status_read_count, n);
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%u comm=%s mode=simple_read ret=%ld sequence=%u policyload=%u\n",
                      n, (u32)a->local.data3, current_comm(), (long)a->ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD);
+                     get_u32_le(g_clean_status_bytes + 4),
+                     get_u32_le(g_clean_status_bytes + 12));
 }
 
 static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
@@ -4536,10 +4536,11 @@ static long init(const char *args, const char *event, void *__user r)
                      (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
-    pr_info("[selinux_hook] K40 CHANNEL CHECK: status_seq=%u status_policyload=%u access_seq_override=1 policydb_seq_override=%u (diagnostic only)\n",
+    pr_info("[selinux_hook] K40 CHANNEL CHECK: status_seq=%u status_policyload=%u access_seq=%u policydb_seq=%u (diagnostic only)\n",
             get_u32_le(g_clean_status_bytes + 4),
             get_u32_le(g_clean_status_bytes + 12),
-            SELINUX_STATUS_CLEAN_SEQUENCE);
+            get_u32_le(g_clean_status_bytes + 4),
+            get_u32_le(g_clean_status_bytes + 4));
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
