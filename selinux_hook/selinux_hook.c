@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t3"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t4"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t3");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t4");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -846,6 +846,24 @@ static bool selinux_49_compat_path(void)
 static bool selinux_414_compat_path(void)
 {
     return kver < VERSION(4, 15, 0);
+}
+
+/*
+ * Isolated K40 experiment: turn on the DirtySepolicy query filter for
+ * 4.19.157, without lying to other code about the kernel ABI.
+ *
+ * In particular, write_op_slot_fallback_allowed() must continue to use
+ * selinux_414_compat_path() so that 4.19 keeps its own fallback behavior.
+ *
+ * NOTE: This filters SELinux query results; it does NOT remove live grants.
+ */
+static bool dirtysepolicy_probe_gate_enabled(void)
+{
+#if defined(K40_TEST_DIRTYSEPOLICY_GATE) && K40_TEST_DIRTYSEPOLICY_GATE
+    if (kver == VERSION(4, 19, 157))
+        return true;
+#endif
+    return selinux_414_compat_path();
 }
 
 static bool clean_policydb_redirect_supported(void)
@@ -2306,7 +2324,7 @@ static bool context_token_matches(const char *query, const char *lit)
 
 static bool dirtysepolicy_context_should_hide(const char *query)
 {
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_probe_gate_enabled())
         return false;
 
     /*
@@ -2476,7 +2494,7 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     const char *src;
     const char *dst;
 
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_probe_gate_enabled())
         return false;
     if (!query || !len)
         return false;
@@ -4518,6 +4536,9 @@ static long init(const char *args, const char *event, void *__user r)
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
+    pr_info("[selinux_hook] K40 test gate dirtysepolicy=%d legacy_abi=%d kver=%x\n",
+            dirtysepolicy_probe_gate_enabled() ? 1 : 0,
+            selinux_414_compat_path() ? 1 : 0, kver);
     resolve_required_symbols_once();
 
     /* Raw spinlock helpers — kfunc wrappers are not exported on this kernel,
