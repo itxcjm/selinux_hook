@@ -1,4 +1,4 @@
-SELINUX_VERSION := 1.1.7-fix-beta-6-suki419-t5
+SELINUX_VERSION := 1.1.7-fix-beta-6-suki419-t6
 
 ifndef KP_DIR
     KP_DIR = ../KernelPatch
@@ -27,7 +27,7 @@ endif
 
 CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -fno-common
 CFLAGS += -mgeneral-regs-only -ffixed-x18
-CFLAGS += -fno-builtin-strlen -fno-builtin-memcpy -fno-exceptions
+CFLAGS += -fno-builtin-strlen -fno-builtin-memcpy -fno-tree-loop-distribute-patterns -fno-exceptions
 CFLAGS += -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
 CFLAGS += -std=gnu99
 
