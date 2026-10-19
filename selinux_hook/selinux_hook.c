@@ -4638,12 +4638,19 @@ static long init(const char *args, const char *event, void *__user r)
         if (!selinux_49_compat_path()) {
             int argc = selinux_state_arg_required() ? 3 : 2;
 
-            g_funcs[g_hooks++] = (void *)security_read_policy_fn;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
             if (selinux_state_arg_required())
-                hook_wrap((void *)security_read_policy_fn, 3, before_security_read_policy_compat, NULL, NULL);
+                hrc = hook_wrap((void *)security_read_policy_fn, 3,
+                                before_security_read_policy_compat, NULL, NULL);
             else
-                hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
+                hrc = hook_wrap((void *)security_read_policy_fn, 2,
+                                before_security_read_policy, NULL, NULL);
+            if (hrc) {
+                pr_warn("[selinux_hook] hook security_read_policy failed rc=%d; policy read remains live\n", hrc);
+            } else {
+                g_funcs[g_hooks++] = (void *)security_read_policy_fn;
+            }
         } else {
             pr_info("[selinux_hook] skip security_read_policy hook on 4.9: helper ABI is device-specific\n");
         }
@@ -4651,11 +4658,17 @@ static long init(const char *args, const char *event, void *__user r)
 
     addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
-        WRITE_ONCE(g_simple_read_from_buffer_hooked, true);
-        selinux_hook_dbg("[selinux_hook] hook simple_read_from_buffer argc=5 for status patch\n");
-        hook_wrap((void *)addr, 5, before_simple_read_from_buffer,
-                  after_simple_read_from_buffer, NULL);
+        hook_err_t hrc;
+        hrc = hook_wrap((void *)addr, 5, before_simple_read_from_buffer,
+                        after_simple_read_from_buffer, NULL);
+        if (hrc) {
+            WRITE_ONCE(g_simple_read_from_buffer_hooked, false);
+            pr_warn("[selinux_hook] hook simple_read_from_buffer failed rc=%d; status direct-copy fallback active\n", hrc);
+        } else {
+            g_funcs[g_hooks++] = (void *)addr;
+            WRITE_ONCE(g_simple_read_from_buffer_hooked, true);
+            selinux_hook_dbg("[selinux_hook] hook simple_read_from_buffer argc=5 installed\n");
+        }
     } else {
         pr_warn("[selinux_hook] cannot find simple_read_from_buffer, status hook will use direct user copy fallback\n");
     }
@@ -4794,14 +4807,22 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip context_struct_compute_av on 4.9: helper ABI is device-specific\n");
         } else if (clean_policydb_redirect_supported()) {
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
-            hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
-                      after_context_struct_compute_av_policydb, NULL);
+            hrc = hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
+                            after_context_struct_compute_av_policydb, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook context_struct_compute_av failed rc=%d; clean policydb redirect unavailable\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
-            hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
+            hrc = hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook legacy context_struct_compute_av failed rc=%d\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         }
     } else {
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
@@ -4827,9 +4848,13 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip selinux_complete_init on 4.9: helper ABI is device-specific\n");
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook selinux_complete_init argc=0\n");
-            hook_wrap((void *)addr, 0, NULL, after_selinux_complete_init, NULL);
+            hrc = hook_wrap((void *)addr, 0, NULL, after_selinux_complete_init, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook selinux_complete_init failed rc=%d; deferred initialization may not run\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_complete_init\n");
@@ -4842,10 +4867,14 @@ static long init(const char *args, const char *event, void *__user r)
         } else {
             int argc = selinux_state_arg_required() ? 2 : 1;
 
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook selinux_policy_commit argc=%d mode=%s\n",
                     argc, selinux_state_arg_required() ? "state+load_state" : "load_state");
-            hook_wrap((void *)addr, argc, NULL, after_selinux_policy_commit, NULL);
+            hrc = hook_wrap((void *)addr, argc, NULL, after_selinux_policy_commit, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook selinux_policy_commit failed rc=%d; clean policy refresh unavailable\n", hrc);
+            else
+                g_funcs[g_hooks++] = (void *)addr;
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_policy_commit\n");
