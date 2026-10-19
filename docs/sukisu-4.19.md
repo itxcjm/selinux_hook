@@ -94,3 +94,17 @@ su -c 'dmesg | grep -i "\\[selinux_hook\\]" | tail -n 180'
 ### 风险提示
 
 保留 `SELinux Enforcing`，不要为追求检测结果直接添加或移除核心 `system_server` / `zygote` 权限。部分规则可能是注入框架正常运行所必需，必须先找出拥有者及模块依赖。\n
+## 八、t4：仅在 4.19.157 试开 DirtySepolicy 查询过滤
+
+用户要求验证在 FolkPatch 曾经正常、SukiSU + SUSFS 下残留两组权限规则的差异。**不要直接把 `selinux_414_compat_path()` 改成 true：** 该函数还被 `write_op_slot_fallback_allowed()` 使用，会改变 4.19 的 Hook 回退逻辑。
+
+本分支 t4 新增 `dirtysepolicy_probe_gate_enabled()`，只在同时满足以下条件时将旧过滤入口放开：
+
+- 构建参数 `K40_TEST_DIRTYSEPOLICY_GATE=1`；
+- KPM 获取到的内核版本恰好为 **4.19.157**。
+
+仅替换 `dirtysepolicy_context_should_hide()` 和 `dirtysepolicy_access_should_deny()` 的入口门控，其他旧内核兼容路径不变。启动日志增加 `K40 test gate dirtysepolicy=1 legacy_abi=0`（符合当前内核时的预期）。
+
+**该实验会改变非特权调用者的 SELinux 查询结果，不会删除现有授权。** Hunter 的多通道不一致提示可能依旧存在甚至增加，因此它只能用来验证内核版本门控是否造成了剩余差异，不能证明 SELinux 策略干净。手机未实机验证前，保持 t3 启动镜像可恢复；不要直接覆盖唯一可启动的 Boot。
+
+如需关闭测试开关，在 Makefile 中改为 `-DK40_TEST_DIRTYSEPOLICY_GATE=0` 并重新构建，或继续使用 t3 对应的旧提交。
