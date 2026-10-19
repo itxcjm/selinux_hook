@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t4"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t5"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t4");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t5");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -2478,7 +2478,13 @@ static long write_clean_access_seqno_response(char *buf, size_t size)
     if (size > len)
         buf[len] = '\0';
 
-    return (long)len;
+    /*
+     * Keep the AVD sequence consistent with the status-page sequence for
+     * this KPM build. The original implementation always emitted 1, while
+     * fill_clean_status_bytes() emits 0 on the user's Linux 4.19 kernel.
+     */
+    return patch_response_seqno(buf, (ssize_t)len,
+                                get_u32_le(g_clean_status_bytes + 4));
 }
 
 static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
@@ -3015,7 +3021,7 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
     if (!avd)
         return;
 
-    WRITE_ONCE(avd->seqno, SELINUX_STATUS_CLEAN_SEQUENCE);
+    WRITE_ONCE(avd->seqno, get_u32_le(g_clean_status_bytes + 4));
     WRITE_ONCE(avd->flags, (u32)a->local.data3);
 }
 
@@ -3042,7 +3048,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 
         if (context_struct_compute_av_intel(clean_pdb, scontext, tcontext,
                                             tclass, &clean_avd, xperms)) {
-            clean_avd.seqno = SELINUX_STATUS_CLEAN_SEQUENCE;
+            clean_avd.seqno = get_u32_le(g_clean_status_bytes + 4);
             clean_avd.flags = avd->flags;
             *avd = clean_avd;
             a->skip_origin = 1;
@@ -3148,6 +3154,14 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
         pr_info("[selinux_hook] DIRTYSEPOLICY deny /sys/fs/selinux/access #%u uid=%d comm=%s query=\"%s\"\n",
                 n, uid, current_comm(), sample);
+        /*
+         * An EINVAL here is not an SELinux allow/deny decision. It makes
+         * otherwise valid /access probes unavailable to policy oracles.
+         * Log the distinction; do not change the existing t4 behavior.
+         */
+        if (n <= 24)
+            pr_warn("[selinux_hook] K40 ORACLE TRACE valid access pair intercepted with EINVAL uid=%u query=\"%s\"\n",
+                    uid, sample);
         a->skip_origin = 1;
         a->ret = -EINVAL;
         return;
@@ -3360,7 +3374,8 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     /* Patch seqno in the access response buffer to match /sys/fs/selinux/status */
     if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
-        ssize_t new_ret = patch_response_seqno(rbuf, live_ret, 1);
+        ssize_t new_ret = patch_response_seqno(rbuf, live_ret,
+                                                get_u32_le(g_clean_status_bytes + 4));
         if (new_ret > 0) {
             live_ret = new_ret;
             a->ret = (uint64_t)new_ret;
@@ -4110,8 +4125,8 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
                 (void *)a->arg1, (size_t)a->arg2, (void *)a->arg3,
                 pos_before, ret, pos_after, g_copy_to_user_name ?: "compat_copy_to_user",
                 SELINUX_KERNEL_STATUS_VERSION,
-                SELINUX_STATUS_CLEAN_SEQUENCE,
-                SELINUX_STATUS_CLEAN_POLICYLOAD);
+                get_u32_le(g_clean_status_bytes + 4),
+                get_u32_le(g_clean_status_bytes + 12));
 
     if (ret < 0)
         return;
@@ -4123,8 +4138,8 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
     a->ret = (uint64_t)ret;
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%d comm=%s ret=%zd sequence=%u policyload=%u copy=%s\n",
                      n, uid, current_comm(), ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD,
+                     get_u32_le(g_clean_status_bytes + 4),
+                     get_u32_le(g_clean_status_bytes + 12),
                      g_copy_to_user_name ?: "compat_copy_to_user");
 }
 
@@ -4163,8 +4178,8 @@ static void after_sel_read_handle_status(hook_fargs4_t *a, void *u)
     WRITE_ONCE(g_status_read_count, n);
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%u comm=%s mode=simple_read ret=%ld sequence=%u policyload=%u\n",
                      n, (u32)a->local.data3, current_comm(), (long)a->ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD);
+                     get_u32_le(g_clean_status_bytes + 4),
+                     get_u32_le(g_clean_status_bytes + 12));
 }
 
 static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
@@ -4521,10 +4536,11 @@ static long init(const char *args, const char *event, void *__user r)
                      (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
-    pr_info("[selinux_hook] K40 CHANNEL CHECK: status_seq=%u status_policyload=%u access_seq_override=1 policydb_seq_override=%u (diagnostic only)\n",
+    pr_info("[selinux_hook] K40 CHANNEL CHECK: status_seq=%u status_policyload=%u access_seq=%u policydb_seq=%u (diagnostic only)\n",
             get_u32_le(g_clean_status_bytes + 4),
             get_u32_le(g_clean_status_bytes + 12),
-            SELINUX_STATUS_CLEAN_SEQUENCE);
+            get_u32_le(g_clean_status_bytes + 4),
+            get_u32_le(g_clean_status_bytes + 4));
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
