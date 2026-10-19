@@ -1,4 +1,4 @@
-SELINUX_VERSION := 1.1.7-fix-beta-6-suki419-t3
+SELINUX_VERSION := 1.1.7-fix-beta-6-suki419-t4
 
 ifndef KP_DIR
     KP_DIR = ../KernelPatch
@@ -29,6 +29,8 @@ CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-unwind-tables -
 CFLAGS += -mgeneral-regs-only -ffixed-x18
 CFLAGS += -fno-builtin-strlen -fno-builtin-memcpy -fno-exceptions
 CFLAGS += -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
+# Explicit K40 4.19.157 test switch: query filtering only, not an ABI override.
+CFLAGS += -DK40_TEST_DIRTYSEPOLICY_GATE=1
 CFLAGS += -std=gnu99
 
 INCLUDE_DIRS := . include patch/include linux linux/include linux/security/selinux/include linux/arch/arm64/include linux/tools/arch/arm64/include
