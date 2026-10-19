@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t7"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t8"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t7");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t8");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -107,6 +107,11 @@ KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁")
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
+/*
+ * AVD seqno is distinct from the mmap/read status sequence. Stock
+ * Android 4.19 DirtySepolicy check expects status.seq=0, AVD.seqno=1.
+ */
+#define SELINUX_AVD_CLEAN_SEQNO 1U
 #define APATCH_MANAGER_PACKAGE "me.bmax.apatch"
 #define APATCH_PACKAGES_LIST_PATH "/data/system/packages.list"
 #define APATCH_PACKAGES_LIST_MAX_SIZE (1024 * 1024)
@@ -502,6 +507,9 @@ static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
 /* Diagnostic-only, capped counter for K40 policy probe monitoring. */
 static u32 g_k40_policy_probe_count;
+/* First app-side clean-policy redirects/AVD computations, diagnostic only. */
+static u32 g_k40_clean_redirect_count;
+static u32 g_k40_clean_av_result_count;
 static bool g_simple_read_from_buffer_hooked;
 static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
@@ -2506,13 +2514,8 @@ static long write_clean_access_seqno_response(char *buf, size_t size)
     if (size > len)
         buf[len] = '\0';
 
-    /*
-     * Keep the AVD sequence consistent with the status-page sequence for
-     * this KPM build. The original implementation always emitted 1, while
-     * fill_clean_status_bytes() emits 0 on the user's Linux 4.19 kernel.
-     */
-    return patch_response_seqno(buf, (ssize_t)len,
-                                get_u32_le(g_clean_status_bytes + 4));
+    /* The response template uses seqno=1 independently of status.seq. */
+    return patch_response_seqno(buf, (ssize_t)len, SELINUX_AVD_CLEAN_SEQNO);
 }
 
 /*
@@ -3000,6 +3003,12 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
      */
     if (clean_policydb_redirect_supported() &&
         current_in_clean_eval_scope() && clean_policydb && !bypass) {
+        if (current_uid() >= 10000 && READ_ONCE(g_k40_clean_redirect_count) < 40) {
+            u32 n = READ_ONCE(g_k40_clean_redirect_count) + 1;
+            WRITE_ONCE(g_k40_clean_redirect_count, n);
+            pr_info("[selinux_hook] K40 CLEAN REDIRECT #%u uid=%u comm=%s scope=1 clean=1\n",
+                    n, current_uid(), current_comm());
+        }
         a->arg0 = (uint64_t)clean_policydb;
         return;
     }
@@ -3064,8 +3073,14 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
     if (!avd)
         return;
 
-    WRITE_ONCE(avd->seqno, get_u32_le(g_clean_status_bytes + 4));
+    WRITE_ONCE(avd->seqno, SELINUX_AVD_CLEAN_SEQNO);
     WRITE_ONCE(avd->flags, (u32)a->local.data3);
+    if (current_uid() >= 10000 && READ_ONCE(g_k40_clean_av_result_count) < 40) {
+        u32 n = READ_ONCE(g_k40_clean_av_result_count) + 1;
+        WRITE_ONCE(g_k40_clean_av_result_count, n);
+        pr_info("[selinux_hook] K40 CLEAN AVD RESULT #%u uid=%u comm=%s allowed=0x%x seqno=%u\n",
+                n, current_uid(), current_comm(), avd->allowed, avd->seqno);
+    }
 }
 
 static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
@@ -3091,7 +3106,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 
         if (context_struct_compute_av_intel(clean_pdb, scontext, tcontext,
                                             tclass, &clean_avd, xperms)) {
-            clean_avd.seqno = get_u32_le(g_clean_status_bytes + 4);
+            clean_avd.seqno = SELINUX_AVD_CLEAN_SEQNO;
             clean_avd.flags = avd->flags;
             *avd = clean_avd;
             a->skip_origin = 1;
@@ -3424,7 +3439,7 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
         ssize_t new_ret = patch_response_seqno(rbuf, live_ret,
-                                                get_u32_le(g_clean_status_bytes + 4));
+                                                SELINUX_AVD_CLEAN_SEQNO);
         if (new_ret > 0) {
             live_ret = new_ret;
             a->ret = (uint64_t)new_ret;
@@ -4588,8 +4603,8 @@ static long init(const char *args, const char *event, void *__user r)
     pr_info("[selinux_hook] K40 CHANNEL CHECK: status_seq=%u status_policyload=%u access_seq=%u policydb_seq=%u (diagnostic only)\n",
             get_u32_le(g_clean_status_bytes + 4),
             get_u32_le(g_clean_status_bytes + 12),
-            get_u32_le(g_clean_status_bytes + 4),
-            get_u32_le(g_clean_status_bytes + 4));
+            SELINUX_AVD_CLEAN_SEQNO,
+            SELINUX_AVD_CLEAN_SEQNO);
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
