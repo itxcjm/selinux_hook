@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t3"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t4"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t3");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t4");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -846,6 +846,16 @@ static bool selinux_49_compat_path(void)
 static bool selinux_414_compat_path(void)
 {
     return kver < VERSION(4, 15, 0);
+}
+
+/*
+ * T4, diagnostic experiment only: the DirtySepolicy filter predicates are
+ * enabled on 4.19 without changing the 4.14-specific SELinux ABI selection.
+ */
+static bool dirtysepolicy_probe_compat_path(void)
+{
+    return selinux_414_compat_path() ||
+           (kver >= VERSION(4, 19, 0) && kver < VERSION(4, 20, 0));
 }
 
 static bool clean_policydb_redirect_supported(void)
@@ -2306,7 +2316,7 @@ static bool context_token_matches(const char *query, const char *lit)
 
 static bool dirtysepolicy_context_should_hide(const char *query)
 {
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_probe_compat_path())
         return false;
 
     /*
@@ -2476,7 +2486,7 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     const char *src;
     const char *dst;
 
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_probe_compat_path())
         return false;
     if (!query || !len)
         return false;
@@ -3088,10 +3098,10 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
 
         WRITE_ONCE(g_k40_policy_probe_count, probe);
         if (probe <= 24)
-            pr_info("[selinux_hook] K40 POLICY PROBE #%u uid=%u comm=%s bypass=%d legacy_gate=%d clean_pdb=%d clean_blob=%d selinux_ready=%d query=\"%s\"\n",
+            pr_info("[selinux_hook] K40 POLICY PROBE #%u uid=%u comm=%s bypass=%d probe_filter_gate=%d clean_pdb=%d clean_blob=%d selinux_ready=%d query=\"%s\"\n",
                     probe, uid, current_comm(),
                     should_bypass_clean_filter(uid) ? 1 : 0,
-                    selinux_414_compat_path() ? 1 : 0,
+                    dirtysepolicy_probe_compat_path() ? 1 : 0,
                     READ_ONCE(g_clean_policydb) ? 1 : 0,
                     READ_ONCE(g_clean_policy_blob) ? 1 : 0,
                     READ_ONCE(g_selinux_ready) ? 1 : 0, sample);
