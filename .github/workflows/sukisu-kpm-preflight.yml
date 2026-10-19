@@ -100,7 +100,18 @@ jobs:
           file "$module" | tee reports/file.txt
           aarch64-linux-gnu-readelf -h "$module" | tee reports/elf-header.txt
           aarch64-linux-gnu-readelf -Ws "$module" > reports/symbols.txt
+          aarch64-linux-gnu-readelf -rW "$module" > reports/relocations.txt
           awk '$7=="UND" {print $8}' reports/symbols.txt | sort -u > reports/undefined-symbols.txt
+          # K40 failure in t5: CALL26 relocation to distant vmlinux memcpy.
+          # An ARM64 ELF compile is NOT enough; this symbol must be local.
+          if awk '$7=="UND" && $8=="memcpy" {found=1} END {exit !found}' reports/symbols.txt; then
+            echo 'ERROR: memcpy is unresolved; will risk R_AARCH64_CALL26 range overflow on K40.'
+            exit 1
+          fi
+          if ! awk '$8=="memcpy" && $7!="UND" {found=1} END {exit !found}' reports/symbols.txt; then
+            echo 'ERROR: expected memcpy implementation in KPM text; symbol not found.'
+            exit 1
+          fi
           grep -q 'AArch64' reports/elf-header.txt
           grep -q 'REL (Relocatable file)' reports/elf-header.txt
           sha256sum "$module" | tee reports/sha256.txt
