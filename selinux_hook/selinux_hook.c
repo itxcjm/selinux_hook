@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t5"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t6"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t5");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t6");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -677,6 +677,31 @@ static ssize_t patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
             tok_start[k] = new_str[k];
     }
     return ret;
+}
+
+/*
+ * KernelPatch KPM loader applies AArch64 CALL26 relocations directly and
+ * cannot make a long-range branch to vmlinux memcpy when the kernel symbol
+ * lies outside +/-128 MiB of the module allocation.
+ *
+ * GCC may emit memcpy for aggregate assignments even with -fno-builtin-memcpy.
+ * Provide a module-local implementation so the linker resolves that symbol
+ * to the nearby KPM text, not to a distant kernel address.
+ *
+ * Volatile pointers prevent the compiler from turning this byte-copy loop
+ * back into a recursive call to memcpy.
+ */
+__attribute__((noinline))
+void *memcpy(void *dst, const void *src, size_t len)
+{
+    volatile unsigned char *d = (volatile unsigned char *)dst;
+    const volatile unsigned char *s = (const volatile unsigned char *)src;
+    size_t i;
+
+    for (i = 0; i < len; i++)
+        d[i] = s[i];
+
+    return dst;
 }
 
 static void copy_bytes(void *dst, const void *src, size_t len)
