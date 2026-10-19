@@ -46,3 +46,29 @@ su -c 'sh /sdcard/Download/inspect-sukisu-419.sh'
 - **SELinux status Hook**：检查 `sel_read_handle_status`、`sel_mmap_handle_status`、`selinux_status_update_seqlock`、`selinux_status_update_policyload` 的 `hook_wrap()` 返回值，失败时不再计入已成功安装的 Hook。
 
 未验证：K40 真机符号 ABI、SukiSU KPM 的 `fp_hook_syscalln()` 行为、策略快照是否干净、检测器是否通过。暂不建议嵌入测试构建，需先备份官方 Boot 并准备恢复措施。
+
+
+## 六、t2 静态问题定位与只读诊断
+
+t1 已在 K40 上验证可以启动，但春秋仍报 `system_server execmem` 与 `zygote -> adb_data_file search`，Hunter 提示 `CONTEXT_CHANNEL_DISAGREEMENT`。源码分析发现：
+
+1. `dirtysepolicy_access_should_deny()` 中已列出对应上下文对，但其入口由 `kver < 4.15` 限制，所以 4.19 上此路径不会对它们处理；其他 clean policydb 重定向能否工作则取决于初始化、ABI 及实际快照。
+2. `fill_clean_status_bytes()` 对 4.19 生成 sequence=0, policyload=0；`patch_response_seqno()` 和 `write_clean_access_seqno_response()` 的一些 access 响应使用 seqno=1，`SELINUX_STATUS_CLEAN_SEQUENCE` 又是 4；不同通道可能产生不一致。
+3. `sc_should_deny_full()` 仅在 `sc_full_mode` 时参与过滤；其开启依赖 `g_selinuxfs_layer_alive` 的健康检查，不能假定在 4.19 上会开启。
+
+这些为静态分析依据，不代表 K40 上各个 Hook 的实际执行顺序已确认。
+
+新增两处只读诊断：
+- `K40 POLICY PROBE`：记录两组上下文对是否到达 `before_sel_write_access`、查询发起 UID、是否旁路、策略快照是否存在；限制最多输出 24 次。
+- `K40 CHANNEL CHECK`：显示固定状态值与 access/policydb 序列号常量。
+
+当前 t2 **没有变更 SELinux 权限判定**，不保证春秋或 Hunter 的检测结果变化。尽量先在现有 t1 上导出日志，而不是立刻再次刷入内核：
+
+```sh
+# 内核日志可能包含设备敏感信息，分享前人工检查
+su -c 'dmesg | grep -i "\\[selinux_hook\\]" | tail -n 180'
+```
+
+还可执行 `tools/audit-k40-policy.sh` 只读汇总模块的 sepolicy.rule 文本与内核日志。找不到文本规则并不意味着没有内核级策略改动。
+
+**禁止为消除检测结果而直接修改核心进程权限或强制冻结 SELinux policyload**；应先排查哪些模块修改了 Policy，并验证设备实际在 Enforcing 下运行。
