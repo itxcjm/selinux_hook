@@ -507,6 +507,9 @@ static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
 /* Diagnostic-only, capped counter for K40 policy probe monitoring. */
 static u32 g_k40_policy_probe_count;
+/* First app-side clean-policy redirects/AVD computations, diagnostic only. */
+static u32 g_k40_clean_redirect_count;
+static u32 g_k40_clean_av_result_count;
 static bool g_simple_read_from_buffer_hooked;
 static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
@@ -3000,6 +3003,12 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
      */
     if (clean_policydb_redirect_supported() &&
         current_in_clean_eval_scope() && clean_policydb && !bypass) {
+        if (current_uid() >= 10000 && READ_ONCE(g_k40_clean_redirect_count) < 40) {
+            u32 n = READ_ONCE(g_k40_clean_redirect_count) + 1;
+            WRITE_ONCE(g_k40_clean_redirect_count, n);
+            pr_info("[selinux_hook] K40 CLEAN REDIRECT #%u uid=%u comm=%s scope=1 clean=1\n",
+                    n, current_uid(), current_comm());
+        }
         a->arg0 = (uint64_t)clean_policydb;
         return;
     }
@@ -3066,6 +3075,12 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
 
     WRITE_ONCE(avd->seqno, SELINUX_AVD_CLEAN_SEQNO);
     WRITE_ONCE(avd->flags, (u32)a->local.data3);
+    if (current_uid() >= 10000 && READ_ONCE(g_k40_clean_av_result_count) < 40) {
+        u32 n = READ_ONCE(g_k40_clean_av_result_count) + 1;
+        WRITE_ONCE(g_k40_clean_av_result_count, n);
+        pr_info("[selinux_hook] K40 CLEAN AVD RESULT #%u uid=%u comm=%s allowed=0x%x seqno=%u\n",
+                n, current_uid(), current_comm(), avd->allowed, avd->seqno);
+    }
 }
 
 static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
