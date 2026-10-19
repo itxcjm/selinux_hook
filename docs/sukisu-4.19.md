@@ -72,3 +72,25 @@ su -c 'dmesg | grep -i "\\[selinux_hook\\]" | tail -n 180'
 还可执行 `tools/audit-k40-policy.sh` 只读汇总模块的 sepolicy.rule 文本与内核日志。找不到文本规则并不意味着没有内核级策略改动。
 
 **禁止为消除检测结果而直接修改核心进程权限或强制冻结 SELinux policyload**；应先排查哪些模块修改了 Policy，并验证设备实际在 Enforcing 下运行。
+
+
+## 七、剩余两项规则的上游来源与建议排障次序
+
+春秋残留：`system_server process execmem`、`zygote -> adb_data_file dir search`。这些权限在公开模块源码中可核实：
+
+- [NeoZygisk sepolicy.rule](https://github.com/JingMatrix/NeoZygisk/blob/main/module/src/sepolicy.rule)：同时包含上述两项。
+- [ReZygisk sepolicy.rule](https://github.com/PerformanC/ReZygisk/blob/main/module/src/sepolicy.rule)：包含 `zygote -> adb_data_file dir search`。
+- [Magisk sepolicy/rules.rs](https://github.com/topjohnwu/Magisk/blob/master/native/src/sepolicy/rules.rs)：包含 `system_server process execmem`；不能因此认定 K40 正在运行 Magisk。
+
+这些是**可能来源**，不是对 K40 已安装模块的识别。用户应在手机上确认模块清单，优先使用 `tools/audit-k40-policy.sh`。
+
+建议依次操作：
+
+1. 在不修改内核或 SELinux 的前提下记录模块清单，定位带有上述规则的 `sepolicy.rule` 或启动态脚本。某些框架在二进制内部注入规则，纯文本搜索并不完整。
+2. 用模块管理器一次只停用**一个**可疑的 Zygisk 注入桥接模块，重启后核对 LSPosed、应用启动是否正常以及春秋规则是否消失。勿在系统运行时直接删除规则文本，已加载策略不会因此自动恢复。
+3. 如果需要判断 Hunter 的通道不一致是否由 `selinux_hook` 造成，应准备一个**同版本内核/SUSFS/SukiSU，但不嵌入本 KPM**的可恢复测试启动镜像，在可回滚条件下对照；不要禁用 SELinux Enforcing。
+4. Hunter 的 `Network Trust Local Risk Signal` 与 SELinux 不属于同一类检查。如状态栏显示 VPN，可在安全且获授权的网络环境下关闭 VPN 作一次对照，结合其展开详情确认具体原因；不能假定 VPN 就是风险来源。
+
+### 风险提示
+
+保留 `SELinux Enforcing`，不要为追求检测结果直接添加或移除核心 `system_server` / `zygote` 权限。部分规则可能是注入框架正常运行所必需，必须先找出拥有者及模块依赖。\n
