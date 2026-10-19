@@ -602,6 +602,8 @@ static void uninstall_write_op_hooks(void);
 static void uninstall_inline_hooks(void);
 static bool event_is_post_init(const char *event);
 static void try_complete_deferred_write_op_install(const char *reason);
+/* SukiSU embedded KPM can initialize before selinuxfs exists. */
+static void sc_install(void);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
@@ -2821,6 +2823,8 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
     selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
     snapshot_clean_policy("complete_init");
     try_complete_deferred_write_op_install("complete_init");
+    /* Retry syscall-layer installation after early embedded KPM init. */
+    sc_install();
 }
 
 /* Hook: selinux_policy_commit */
@@ -2850,6 +2854,8 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
     try_complete_deferred_write_op_install("policy_commit");
+    /* Retry once SELinux commits a policy; early selinuxfs may be absent. */
+    sc_install();
 }
 
 /*
@@ -2863,22 +2869,22 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
  */
 static bool event_is_post_init(const char *event)
 {
-    const char * const pre = "pre-kernel-init";
-    const char *p = pre;
-
+    /*
+     * Embedded KPMs may be invoked at several KernelPatch early-boot events.
+     * These events do not guarantee that selinux_complete_init() has run.
+     * Reuse the local bytewise string comparator (no libc strcmp in KPM).
+     *
+     * A NULL event retains upstream behavior for explicitly loaded KPMs;
+     * the SELinux-ready callback still retries the deferred hook separately.
+     */
     if (!event)
         return true;
-    /*
-     * Compare byte-by-byte against "pre-kernel-init" without invoking the
-     * out-of-line strcmp() libcall, which is unavailable in the KPM loader.
-     */
-    while (*p && *event && *p == *event) {
-        p++;
-        event++;
-    }
-    if (*p == '\0' && *event == '\0')
-        return false;
-    return true;
+
+    return !(str_eq_lit(event, "paging-init") ||
+             str_eq_lit(event, "pre-kernel-init") ||
+             str_eq_lit(event, "post-kernel-init") ||
+             str_eq_lit(event, "pre-init-first-stage") ||
+             str_eq_lit(event, "pre-exec-init"));
 }
 
 /*
@@ -4428,20 +4434,32 @@ static void before_sys_write(hook_fargs3_t *a, void *u)
 
 static void sc_install(void)
 {
-    sc_fget_fn = (void *(*)(unsigned int))lookup_name_optional_suffix("fget");
-    sc_fput_fn = (void (*)(void *))lookup_name_optional_suffix("fput");
+    /*
+     * Idempotent: called at KPM init and again after SELinux initialization.
+     * SukiSU embedded modules may run before /sys/fs/selinux is mounted.
+     */
+    if (sc_hooked)
+        return;
 
-    if (!sc_fget_fn || !sc_fput_fn) {
-        pr_warn("[selinux_hook] SC fget/fput unresolved, syscall layer disabled\n");
+    if (!filp_open_fn || !filp_close_fn) {
+        pr_warn("[selinux_hook] SC filp_open/filp_close unavailable; defer syscall layer\n");
         return;
     }
+
+    sc_fget_fn = (void *(*)(unsigned int))lookup_name_optional_suffix("fget");
+    sc_fput_fn = (void (*)(void *))lookup_name_optional_suffix("fput");
+    if (!sc_fget_fn || !sc_fput_fn) {
+        pr_warn("[selinux_hook] SC fget/fput unresolved; will retry when SELinux is ready\n");
+        return;
+    }
+
     if (!sc_cache_fop()) {
-        pr_warn("[selinux_hook] SC selinuxfs fop unavailable, syscall layer disabled\n");
+        pr_info("[selinux_hook] SC selinuxfs not mounted yet; defer until SELinux ready\n");
         return;
     }
 
     if (fp_hook_syscalln(__NR_write, 3, before_sys_write, NULL, NULL)) {
-        pr_warn("[selinux_hook] SC fp_hook_syscalln(write) failed, syscall layer disabled\n");
+        pr_warn("[selinux_hook] SC fp_hook_syscalln(write) failed; syscall layer unavailable\n");
         return;
     }
 
