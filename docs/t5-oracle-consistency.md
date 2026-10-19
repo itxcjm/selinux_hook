@@ -15,6 +15,7 @@
 
 仅对两个已经存在的 AVD 序列号输出通道统一取值来源：
 - `after_sel_write_common()` 的 `patch_response_seqno()` 不再直接写死 1，改为采用本 KPM 生成的 `g_clean_status_bytes` 的 `sequence` 字段；
+- `context_struct_compute_av` 的两条 policydb 计算路径也不再固定写入 `seqno=4`，改为同一序列号来源，并修正 `STATUS probe` 日志数值；
 - `write_clean_access_seqno_response()` 对自建的 class=0 AVD 响应也保持一致；
 - 在原有直接返回 `-EINVAL` 的 DirtySepolicy access 处理支路添加 **最多 24 次**的 `K40 ORACLE TRACE` 提醒，帮助辨别 `ACCESS_UNAVAILABLE` 来源。
 - 使用独立版本 `1.1.7-fix-beta-6-suki419-t5`，并保留 t4 未更改。
@@ -32,3 +33,7 @@
 ## 风险
 
 本分支只通过 CI 编译预检，不能证明 K40 实机加载、稳定性、安全性或检测工具结果。修改 status/AVD 输出是用于比较两通道内部一致性的实验，不等价于修复真实 SELinux Policy。
+
+## 补充：Hunter 内存及 app_zygote 来源检查
+
+新增 `tools/audit-hunter-k40.sh`，只读检查当前内核状态、KPM Hook 诊断、模块名称、app_zygote/WebView 进程标签和 Trichrome/WebView 提供者。将脚本复制到手机后，以 root shell 执行 `sh /sdcard/Download/audit-hunter-k40.sh`，先检查输出是否含敏感信息，再分享。它不能代替真正的 SELinux Policy 审计。
