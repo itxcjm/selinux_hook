@@ -1,7 +1,7 @@
 # K40 / SukiSU Ultra / SUSFS — SELinux KPM 兼容性预检
 
 目标系统：Redmi K40 (alioth), Linux 4.19.157, Android 13, SukiSU Ultra + SUSFS。
-此分支暂不更改原始 `selinux_hook.c`，不改变 SELinux 内核决策，不假定旧版 FolkPatch 与 SukiSU 的 Hook ABI 完全相同。
+此分支现在包含对 `selinux_hook.c` 的**早期加载兼容性修复**：识别早期 KPM 事件、在 SELinux 初始化完成后重试 syscall Hook，以及记录 `status` 系列 Hook 的实际安装错误。未修改 SELinux 策略规则匹配和判决值；不能仅凭编译成功认定已经通过检测。
 
 ## 一、构建
 
@@ -38,3 +38,11 @@ su -c 'sh /sdcard/Download/inspect-sukisu-419.sh'
 此分支是可复现的构建/诊断分支，而不是“已经修好春秋检测”的正式兼容版本。
 目前未取得设备上的内核日志，也没有在 K40 上完成运行时验证。
 在排查前保留可恢复的原始 Boot，设备须维持 SELinux Enforcing。
+
+## 五、已提交的兼容性修改
+
+- **SukiSU embedded 早期事件**：`paging-init`、`pre-kernel-init`、`post-kernel-init`、`pre-init-first-stage` 和 `pre-exec-init` 暂不视为已完成 SELinux 初始化。
+- **延迟 SC Hook**：初始化阶段 `/sys/fs/selinux` 尚未挂载导致 `sc_cache_fop()` 失败时，在 `selinux_complete_init` 与 `selinux_policy_commit` 回调后再次尝试；添加幂等保护和文件操作符判空。
+- **SELinux status Hook**：检查 `sel_read_handle_status`、`sel_mmap_handle_status`、`selinux_status_update_seqlock`、`selinux_status_update_policyload` 的 `hook_wrap()` 返回值，失败时不再计入已成功安装的 Hook。
+
+未验证：K40 真机符号 ABI、SukiSU KPM 的 `fp_hook_syscalln()` 行为、策略快照是否干净、检测器是否通过。暂不建议嵌入测试构建，需先备份官方 Boot 并准备恢复措施。
