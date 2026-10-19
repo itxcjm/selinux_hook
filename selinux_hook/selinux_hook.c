@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t6"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t7"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t6");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t7");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -481,6 +481,9 @@ static bool g_clean_policydb_direct;
 static bool g_selinuxfs_layer_alive;
 static bool g_clean_sidtab_convert_canceled;
 static void *g_clean_policydb;
+/* Only true after the necessary clean policy computation hooks actually install. */
+static bool g_clean_av_hooked;
+static bool g_clean_context_lookup_hooked;
 static void *g_first_policy;
 static size_t g_policydb_offset;
 static u32 g_clean_eval_depth;
@@ -2512,6 +2515,21 @@ static long write_clean_access_seqno_response(char *buf, size_t size)
                                 get_u32_le(g_clean_status_bytes + 4));
 }
 
+/*
+ * Experimental t7: on 4.19, use the installed clean-policydb computation
+ * rather than substituting EINVAL for structurally valid /access requests.
+ * Both hooks must actually have installed; otherwise keep previous behavior.
+ */
+static bool k40_clean_avd_route_ready(void)
+{
+    return kver >= VERSION(4, 19, 0) &&
+           kver < VERSION(4, 20, 0) &&
+           clean_policydb_redirect_supported() &&
+           READ_ONCE(g_clean_policydb) &&
+           READ_ONCE(g_clean_av_hooked) &&
+           READ_ONCE(g_clean_context_lookup_hooked);
+}
+
 static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
 {
     const char *src;
@@ -3166,7 +3184,13 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
-    if (dirtysepolicy_access_should_deny(sample, sample_len)) {
+    /*
+     * Unlike EACCES/AVD.allowed=0, EINVAL makes otherwise valid access pairs
+     * unreadable. Try clean-policydb AVD evaluation only when both needed
+     * hooks are available; do not globally change SELinux/ABI decisions.
+     */
+    if (dirtysepolicy_access_should_deny(sample, sample_len) &&
+        !k40_clean_avd_route_ready()) {
         n = READ_ONCE(g_clean_access_count) + 1;
         WRITE_ONCE(g_clean_access_count, n);
         a->local.data0 = 4;
@@ -4864,8 +4888,10 @@ static long init(const char *args, const char *event, void *__user r)
                             after_context_struct_compute_av_policydb, NULL);
             if (hrc)
                 pr_warn("[selinux_hook] hook context_struct_compute_av failed rc=%d; clean policydb redirect unavailable\n", hrc);
-            else
+            else {
                 g_funcs[g_hooks++] = (void *)addr;
+                WRITE_ONCE(g_clean_av_hooked, true);
+            }
         } else {
             hook_err_t hrc;
             pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
@@ -4884,9 +4910,15 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip string_to_context_struct on 4.9: helper ABI is device-specific\n");
         } else if (clean_policydb_redirect_supported()) {
-            g_funcs[g_hooks++] = (void *)addr;
+            hook_err_t hrc;
             pr_info("[selinux_hook] hook string_to_context_struct argc=5\n");
-            hook_wrap((void *)addr, 5, before_policydb_arg0, NULL, NULL);
+            hrc = hook_wrap((void *)addr, 5, before_policydb_arg0, NULL, NULL);
+            if (hrc)
+                pr_warn("[selinux_hook] hook string_to_context_struct failed rc=%d; clean context route unavailable\n", hrc);
+            else {
+                g_funcs[g_hooks++] = (void *)addr;
+                WRITE_ONCE(g_clean_context_lookup_hooked, true);
+            }
         } else {
             pr_info("[selinux_hook] skip legacy string_to_context_struct policydb redirect\n");
         }
