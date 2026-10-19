@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t1"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t2"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t1");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t2");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
