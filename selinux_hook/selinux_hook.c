@@ -80,9 +80,9 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t4"
+#define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t5"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t4");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t5");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -2478,7 +2478,13 @@ static long write_clean_access_seqno_response(char *buf, size_t size)
     if (size > len)
         buf[len] = '\0';
 
-    return (long)len;
+    /*
+     * Keep the AVD sequence consistent with the status-page sequence for
+     * this KPM build. The original implementation always emitted 1, while
+     * fill_clean_status_bytes() emits 0 on the user's Linux 4.19 kernel.
+     */
+    return patch_response_seqno(buf, (ssize_t)len,
+                                get_u32_le(g_clean_status_bytes + 4));
 }
 
 static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
@@ -3148,6 +3154,14 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
         pr_info("[selinux_hook] DIRTYSEPOLICY deny /sys/fs/selinux/access #%u uid=%d comm=%s query=\"%s\"\n",
                 n, uid, current_comm(), sample);
+        /*
+         * An EINVAL here is not an SELinux allow/deny decision. It makes
+         * otherwise valid /access probes unavailable to policy oracles.
+         * Log the distinction; do not change the existing t4 behavior.
+         */
+        if (n <= 24)
+            pr_warn("[selinux_hook] K40 ORACLE TRACE valid access pair intercepted with EINVAL uid=%u query=\"%s\"\n",
+                    uid, sample);
         a->skip_origin = 1;
         a->ret = -EINVAL;
         return;
@@ -3360,7 +3374,8 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     /* Patch seqno in the access response buffer to match /sys/fs/selinux/status */
     if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
-        ssize_t new_ret = patch_response_seqno(rbuf, live_ret, 1);
+        ssize_t new_ret = patch_response_seqno(rbuf, live_ret,
+                                                get_u32_le(g_clean_status_bytes + 4));
         if (new_ret > 0) {
             live_ret = new_ret;
             a->ret = (uint64_t)new_ret;
