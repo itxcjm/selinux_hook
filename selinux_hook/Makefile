@@ -1,4 +1,4 @@
-SELINUX_VERSION := 1.1.7-fix-beta-6
+SELINUX_VERSION := 1.1.7-fix-beta-6-suki419-t1
 
 ifndef KP_DIR
     KP_DIR = ../KernelPatch
