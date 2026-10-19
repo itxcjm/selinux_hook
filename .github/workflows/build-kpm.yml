@@ -33,10 +33,6 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 1
 
-      - name: Update system and install dependencies
-        run: |
-          sudo apt update -y
-
       - name: Restore GCC cross-toolchain from cache
         id: toolchain-cache
         uses: actions/cache@v4
@@ -72,10 +68,8 @@ jobs:
         run: |
           mkdir target
 
-          for dir in $(ls -d */ | grep -v '^KernelPatch/$\|^target/$\|^arm-gnu-toolchain'); do
-            make -C ${dir} CC="ccache ${TARGET_COMPILE}gcc"
-            mv ${dir}*.kpm target
-          done
+          make -C selinux_hook CC="ccache ${TARGET_COMPILE}gcc"
+          mv selinux_hook/*.kpm target/
 
       - name: Compiler cache statistics
         if: always()
