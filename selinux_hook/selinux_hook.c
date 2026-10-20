@@ -2115,6 +2115,10 @@ static void snapshot_clean_policy(const char *reason)
     WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
     WRITE_ONCE(g_clean_policy_len, len);
     WRITE_ONCE(g_clean_policy_blob, data);
+    if (kver >= VERSION(4, 19, 0) && kver < VERSION(4, 20, 0))
+        pr_info("[selinux_hook] K40 CLEAN SNAPSHOT saved reason=%s len=%zu dirty_seen=%d has_magisk=%d\n",
+                reason ?: "(null)", len, READ_ONCE(g_dirty_policy_seen) ? 1 : 0,
+                READ_ONCE(g_clean_policy_has_magisk) ? 1 : 0);
     selinux_hook_dbg("[selinux_hook] CLEAN policy snapshot saved reason=%s blob=%px len=%zu has_magisk=%d\n",
                      reason ?: "(null)", data, len, READ_ONCE(g_clean_policy_has_magisk));
 
@@ -3146,6 +3150,8 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     a->local.data0 = 0;
     a->local.data1 = 0;
     a->local.data2 = 0;
+    /* Direct hook_wrap() callers do not pass through the zeroed write_op wrapper. */
+    a->local.data3 = 0;
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
@@ -3162,13 +3168,20 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
 
         WRITE_ONCE(g_k40_policy_probe_count, probe);
         if (probe <= 24)
-            pr_info("[selinux_hook] K40 POLICY PROBE #%u uid=%u comm=%s bypass=%d probe_filter_gate=%d clean_pdb=%d clean_blob=%d selinux_ready=%d query=\"%s\"\n",
+            pr_info("[selinux_hook] K40 POLICY PROBE #%u uid=%u comm=%s bypass=%d probe_filter_gate=%d clean_pdb=%d clean_blob=%d selinux_ready=%d route_ready=%d av_hook=%d context_hook=%d write_op_access=%d write_op_context=%d dirty_seen=%d clean_direct=%d query=\"%s\"\n",
                     probe, uid, current_comm(),
                     should_bypass_clean_filter(uid) ? 1 : 0,
                     dirtysepolicy_probe_compat_path() ? 1 : 0,
                     READ_ONCE(g_clean_policydb) ? 1 : 0,
                     READ_ONCE(g_clean_policy_blob) ? 1 : 0,
-                    READ_ONCE(g_selinux_ready) ? 1 : 0, sample);
+                    READ_ONCE(g_selinux_ready) ? 1 : 0,
+                    k40_clean_avd_route_ready() ? 1 : 0,
+                    READ_ONCE(g_clean_av_hooked) ? 1 : 0,
+                    READ_ONCE(g_clean_context_lookup_hooked) ? 1 : 0,
+                    READ_ONCE(g_write_op_access_patched) ? 1 : 0,
+                    READ_ONCE(g_write_op_context_patched) ? 1 : 0,
+                    READ_ONCE(g_dirty_policy_seen) ? 1 : 0,
+                    READ_ONCE(g_clean_policydb_direct) ? 1 : 0, sample);
     }
 
     if (should_bypass_clean_filter(uid)) {
@@ -3305,6 +3318,15 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     } else {
         a->local.data0 = 0;
     }
+    if (uid >= 10000 && sample_len &&
+        (access_contexts_match(sample, "u:r:system_server:s0", "u:r:system_server:s0") ||
+         access_contexts_match(sample, "u:r:zygote:s0", "u:object_r:adb_data_file:s0"))) {
+        pr_info("[selinux_hook] K40 SCOPE RESULT uid=%u comm=%s entered=%d scope_now=%d clean_pdb=%d route_ready=%d query=\"%s\"\n",
+                uid, current_comm(), a->local.data3 ? 1 : 0,
+                current_in_clean_eval_scope() ? 1 : 0,
+                READ_ONCE(g_clean_policydb) ? 1 : 0,
+                k40_clean_avd_route_ready() ? 1 : 0, sample);
+    }
 }
 
 /* Hook: /sys/fs/selinux/context write handler */
@@ -3323,6 +3345,8 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     a->local.data0 = 0;
     a->local.data1 = 0;
     a->local.data2 = 0;
+    /* A skipped /context query must never inherit a prior scope marker. */
+    a->local.data3 = 0;
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
