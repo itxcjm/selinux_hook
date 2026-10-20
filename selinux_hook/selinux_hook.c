@@ -82,7 +82,7 @@ KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
 #define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t8"
 #endif
-KPM_VERSION("1.1.7-fix-beta-6-suki419-t8");
+KPM_VERSION("1.1.7-fix-beta-6-suki419-t10-t4gate");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -2527,8 +2527,22 @@ static long write_clean_access_seqno_response(char *buf, size_t size)
  * rather than substituting EINVAL for structurally valid /access requests.
  * Both hooks must actually have installed; otherwise keep previous behavior.
  */
+/*
+ * T10 diagnostic A/B: restore the T4 decision gate only on Android 4.19.
+ * When the gate is closed, the original T4-style interception branch handles
+ * the selected access probes.  Other access queries, policy loads and actual
+ * SELinux enforcement remain on the pre-existing T9 paths.
+ *
+ * This is an isolated regression test, NOT an assertion of policy integrity.
+ * Compare with unchanged T9 and T4 before drawing conclusions.
+ */
+#define K40_T10_T4_ACCESS_GATE 1
 static bool k40_clean_avd_route_ready(void)
 {
+#if K40_T10_T4_ACCESS_GATE
+    if (kver >= VERSION(4, 19, 0) && kver < VERSION(4, 20, 0))
+        return false;
+#endif
     return kver >= VERSION(4, 19, 0) &&
            kver < VERSION(4, 20, 0) &&
            clean_policydb_redirect_supported() &&
@@ -4629,6 +4643,8 @@ static long init(const char *args, const char *event, void *__user r)
             get_u32_le(g_clean_status_bytes + 12),
             SELINUX_AVD_CLEAN_SEQNO,
             SELINUX_AVD_CLEAN_SEQNO);
+    pr_info("[selinux_hook] K40 T10 AB TEST: kernel_419_t4_access_gate=%d (diagnostic rollback of t7 only)\\n",
+            K40_T10_T4_ACCESS_GATE);
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
