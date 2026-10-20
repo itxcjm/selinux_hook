@@ -117,6 +117,48 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # Also commit the diagnostics back onto a scratch branch so they can be
+      # read with a plain `git fetch` when the API and the run log are not
+      # reachable (both are commonly rate limited or auth gated).
+      # The logs are copied to a temp dir first because the checkout below
+      # resets the workspace.
+      - name: Publish diagnostics to a scratch ref
+        if: failure()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/reports"
+          cp -f "$GITHUB_WORKSPACE/reports/syntax.log" "$tmp/reports/" 2>/dev/null || true
+          cp -f "$GITHUB_WORKSPACE/reports/compile.log" "$tmp/reports/" 2>/dev/null || true
+          echo "TMPDIR=$tmp" >> "$GITHUB_ENV"
+          {
+            echo "diagnostics for $GITHUB_SHA"
+            echo "--- files ---"
+            ls -la "$tmp/reports" || true
+          }
+      - name: Checkout for orphan push
+        if: failure()
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: true
+      - name: Push diagnostics to scratch branch
+        if: failure()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan k40-ci-diagnostics
+          git rm -rf --quiet . >/dev/null 2>&1 || true
+          mkdir -p reports
+          cp -f "$TMPDIR/reports/"* reports/ 2>/dev/null || true
+          git add -A reports
+          git commit -m "ci: compiler diagnostics for $GITHUB_SHA" || exit 0
+          git push --force origin k40-ci-diagnostics
+
       - name: Check AArch64 ELF and collect link requirements
         shell: bash
         run: |
