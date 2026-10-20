@@ -86,9 +86,36 @@ jobs:
 
       - name: Compile SukiSU test KPM
         run: |
+          set -o pipefail
+          mkdir -p reports
           make -C selinux_hook clean
-          make -C selinux_hook -j2 TARGET_COMPILE=aarch64-linux-gnu- CC="ccache aarch64-linux-gnu-gcc"
+          # -fsyntax-only keeps the full diagnostic in the log even when a later
+          # stage (codegen, ELF checks) is what actually fails.
+          aarch64-linux-gnu-gcc -fsyntax-only \
+            -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-unwind-tables \
+            -fno-stack-protector -fno-common -mgeneral-regs-only -ffixed-x18 \
+            -fno-builtin-strlen -fno-builtin-memcpy -fno-tree-loop-distribute-patterns \
+            -fno-exceptions -std=gnu99 -DSELINUX_VERSION=\"1.1.7-b6-k40-t12\" \
+            $(for d in . include patch/include linux linux/include \
+                      linux/security/selinux/include linux/arch/arm64/include \
+                      linux/tools/arch/arm64/include; do echo -IKernelPatch/kernel/$d; done) \
+            selinux_hook/selinux_hook.c 2>&1 | tee reports/syntax.log
+          make -C selinux_hook -j2 TARGET_COMPILE=aarch64-linux-gnu- CC="ccache aarch64-linux-gnu-gcc" 2>&1 | tee reports/compile.log
           ccache --show-stats
+
+      # Upload the compiler diagnostics even when the build fails: a failing
+      # compile never reaches the ELF checks below, so without this the only
+      # visible signal is "exit code 2".
+      - name: Upload compiler logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-kpm-compile-failed
+          path: |
+            reports/syntax.log
+            reports/compile.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Check AArch64 ELF and collect link requirements
         shell: bash
