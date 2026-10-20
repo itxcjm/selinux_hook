@@ -82,7 +82,7 @@ KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
 #define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t8"
 #endif
-KPM_VERSION("1.1.7-b6-k40-t11");
+KPM_VERSION("1.1.7-b6-k40-t12");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -112,6 +112,25 @@ KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁")
  * Android 4.19 DirtySepolicy check expects status.seq=0, AVD.seqno=1.
  */
 #define SELINUX_AVD_CLEAN_SEQNO 1U
+
+/*
+ * KSU selinux_hide 集成 / KSU selinux_hide integration：
+ * 上游 kernel/feature/selinux_hide.c 的 my_write_access() 对 app uid 从不
+ * 返回 -EINVAL，而是用 backup policy 算出真实 av_decision，再按内核
+ * sel_write_access() 的格式写回缓冲区（seqno 固定 1）。
+ *
+ * 本 KPM 之前对已知探针直接 a->ret = -EINVAL，导致策略 oracle 拿不到可解析的
+ * AVD（Hunter 报 ACCESS_UNAVAILABLE）。这里改为在 clean policydb 上真正计算，
+ * 语义与上游一致。
+ */
+#define SELINUX_HIDE_ACCESS_FMT "%x %x %x %x %u %x"
+/* 内核 sel_write_access() 用 SIMPLE_TRANSACTION_LIMIT(=PAGE_SIZE) 做上界。 */
+#define SELINUX_HIDE_ACCESS_MAX 4096
+/* sym_val_to_name 反查时允许扫描的最大符号数，避免异常 nprim 拖垮响应路径。 */
+#define SELINUX_HIDE_SYM_SCAN_MAX 8192
+/* 每类符号的反查结果缓存槽位。 */
+#define SELINUX_HIDE_SYM_CACHE_SLOTS 64
+
 #define APATCH_MANAGER_PACKAGE "me.bmax.apatch"
 #define APATCH_PACKAGES_LIST_PATH "/data/system/packages.list"
 #define APATCH_PACKAGES_LIST_MAX_SIZE (1024 * 1024)
@@ -396,6 +415,10 @@ struct avtab {
 #define SYM_LEVELS 6
 #define SYM_CATS 7
 #define SYM_NUM 8
+/* av_decision.flags：source type 落在 permissive_map 时置位。 */
+#ifndef AVD_FLAGS_PERMISSIVE
+#define AVD_FLAGS_PERMISSIVE 0x0001
+#endif
 #define OCON_ISID 0
 #define OCON_FS 1
 #define OCON_PORT 2
@@ -513,6 +536,31 @@ static u32 g_k40_clean_av_result_count;
 static bool g_simple_read_from_buffer_hooked;
 static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
+/*
+ * name -> value 反查缓存 / name -> value reverse lookup cache：
+ * clean policydb 的 sym_val_to_name[i][value-1] 存 char *，遍历比较即可把
+ * context 里的类型/角色/用户名换成 av 计算需要的数值。缓存避免每次
+ * /access 查询都重扫整张符号表。
+ */
+struct hide_sym_cache {
+    const char *name;
+    u32 len;
+    u32 value;
+    u32 sym;
+    bool valid;
+};
+
+static struct hide_sym_cache g_hide_sym_cache[SELINUX_HIDE_SYM_CACHE_SLOTS];
+static u32 g_hide_sym_cache_next;
+static u32 g_hide_sym_cache_hits;
+static u32 g_hide_sym_cache_misses;
+/* clean policydb 上的 AVD 计算是否可用；任一步失败后不再重试。 */
+static bool g_hide_avd_disabled;
+/* 真实 AVD 应答计数，便于设备侧确认该路径确实被走到。 */
+static u32 g_hide_avd_answer_count;
+/* clean policydb 上算不出 AVD 的次数（未知 type/class 等），仅诊断用。 */
+static u32 g_hide_avd_failed;
+
 struct access_probe {
     u32 id;
     uid_t uid;
@@ -620,6 +668,20 @@ static void sc_install(void);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
+
+/* KSU selinux_hide 集成：用 clean policydb 算出真实 AVD 并按内核格式应答。 */
+static u32 hide_sym_value_by_name(struct policydb *pdb, u32 sym,
+                                  const char *name, size_t len);
+static void hide_sym_cache_reset(void);
+static bool hide_parse_context(struct policydb *pdb, const char *ctx, size_t len,
+                               struct context *out);
+static bool hide_compute_avd(struct policydb *pdb, const char *scon, size_t scon_len,
+                             const char *tcon, size_t tcon_len, u16 tclass,
+                             struct av_decision *avd);
+static ssize_t hide_format_avd(char *buf, size_t size, const struct av_decision *avd);
+static bool hide_class_value_by_name(struct policydb *pdb, const char *name,
+                                     size_t len, u16 *out_class);
+static bool k40_hide_avd_ready(void);
 
 /*
  * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
@@ -1529,6 +1591,33 @@ static unsigned int ebitmap_next_positive_intel(struct ebitmap *e,
          (bit) < (e)->highbit; \
          (bit) = ebitmap_next_positive_intel((e), &(n), (bit)))
 
+/*
+ * 单 bit 查询，等价内核 ebitmap_get_bit()：判断 bit 位是否置起。
+ * KSU selinux_hide 用它判断 source type 是否落在 permissive_map。
+ */
+static bool ebitmap_get_bit_intel(const struct ebitmap *e, u32 bit)
+{
+    const struct ebitmap_node *node;
+    u32 unit;
+    u32 idx;
+
+    if (!e || !e->node || bit >= e->highbit)
+        return false;
+
+    unit = bit / SELINUX_EBITMAP_UNIT_BITS;
+    idx = bit % SELINUX_EBITMAP_UNIT_BITS;
+    if (unit >= SELINUX_EBITMAP_UNIT_NUMS)
+        return false;
+
+    for (node = e->node; node; node = node->next) {
+        if (bit >= node->startbit &&
+            bit < node->startbit + SELINUX_EBITMAP_UNIT_NUMS * SELINUX_EBITMAP_UNIT_BITS)
+            return (node->maps[unit] & (1UL << idx)) != 0;
+    }
+
+    return false;
+}
+
 static void services_compute_xperms_drivers_intel(struct extended_perms *xperms,
                                                   struct avtab_node *node)
 {
@@ -2023,6 +2112,8 @@ static void refresh_clean_policydb(const char *reason, bool allow_fallback)
 
     policy = g_clean_load_state.policy;
     WRITE_ONCE(g_clean_policydb, (void *)((char *)policy + off));
+    /* 换了 policydb 实例，之前缓存的 name->value 已失效。 */
+    hide_sym_cache_reset();
 }
 
 static void try_load_clean_policydb_from_blob(const char *reason)
@@ -2063,6 +2154,7 @@ static void try_load_clean_policydb_from_blob(const char *reason)
 
     WRITE_ONCE(g_clean_policydb, policydb);
     WRITE_ONCE(g_clean_policydb_direct, true);
+    hide_sym_cache_reset();
     pr_info("[selinux_hook] CLEAN policydb_read saved reason=%s policydb=%px blob=%px len=%zu alloc=%u\n",
             reason ?: "(null)", policydb, blob, len, CLEAN_POLICYDB_ALLOC_SIZE);
 }
@@ -2536,6 +2628,327 @@ static long write_clean_access_seqno_response(char *buf, size_t size)
 }
 
 /*
+ * ============================================================================
+ * KSU selinux_hide 集成 / KSU selinux_hide integration
+ *
+ * 上游 tiann/KernelSU kernel/feature/selinux_hide.c 的 my_write_access()：
+ * 对 uid >= 10000 的调用者，它**从不**返回 -EINVAL，而是
+ *   1) 用 backup_sepolicy（即未被 root 框架改写的 clean policy）做
+ *      security_context_to_sid()；
+ *   2) 用 clean policydb 做 security_compute_av_user()；
+ *   3) 按内核 sel_write_access() 的格式写回 "allowed perms auditallow
+ *      auditdeny seqno flags"，并把 avd.seqno 固定为 1。
+ *
+ * 本 KPM 原先对已知探针一律 a->ret = -EINVAL。策略 oracle 拿到 EINVAL 就无法
+ * 解析出 AVD，只能报 ACCESS_UNAVAILABLE —— 这与 t5 文档里记录的现象一致。
+ * 下面按上游语义补齐：真正在 clean policydb 上算出 av_decision，再逐字节
+ * 复刻内核格式。
+ *
+ * 边界：
+ *   - 只读 clean policydb，不写任何在线策略，不改 Enforcing，不新增/删除规则；
+ *   - class 名与类型名都取自 clean policydb，未知名字一律当作无效查询；
+ *   - 计算失败时返回 0，由调用方回退到原有 EINVAL 行为，不引入新的失败模式。
+ * ============================================================================
+ */
+
+/*
+ * clean policydb 的 sym_val_to_name[sym][value-1] 存 char *（4.19 policydb_index
+ * 分配的是 char * 数组），因此按名字反查 value 就是线性扫描比较字符串。
+ */
+static u32 hide_sym_value_by_name(struct policydb *pdb, u32 sym,
+                                  const char *name, size_t len)
+{
+    struct flex_array *fa;
+    u32 nprim;
+    u32 value;
+    u32 i;
+
+    if (!pdb || !name || !len)
+        return 0;
+    if (sym >= SYM_NUM)
+        return 0;
+
+    /* 先查缓存：/access 探针的 context 高度重复，命中可省掉整表扫描。 */
+    for (i = 0; i < SELINUX_HIDE_SYM_CACHE_SLOTS; i++) {
+        struct hide_sym_cache *c = &g_hide_sym_cache[i];
+
+        if (!c->valid || c->sym != sym)
+            continue;
+        if (c->len != len)
+            continue;
+        if (token_eq_lit(name, len, c->name)) {
+            WRITE_ONCE(g_hide_sym_cache_hits, READ_ONCE(g_hide_sym_cache_hits) + 1);
+            return c->value;
+        }
+    }
+
+    fa = pdb->sym_val_to_name[sym];
+    nprim = pdb->symtab[sym].nprim;
+    if (!fa || !nprim || nprim > SELINUX_HIDE_SYM_SCAN_MAX)
+        return 0;
+
+    for (value = 1; value <= nprim; value++) {
+        const char *sym_name = (const char *)flex_array_get_fn(fa, value - 1);
+
+        if (!sym_name)
+            continue;
+        if (token_eq_lit(name, len, sym_name))
+            break;
+    }
+
+    if (value > nprim) {
+        WRITE_ONCE(g_hide_sym_cache_misses, READ_ONCE(g_hide_sym_cache_misses) + 1);
+        return 0;
+    }
+
+    {
+        struct hide_sym_cache *c = &g_hide_sym_cache[g_hide_sym_cache_next];
+
+        c->name = sym_name;
+        c->len = len;
+        c->value = value;
+        c->sym = sym;
+        c->valid = true;
+        g_hide_sym_cache_next = (g_hide_sym_cache_next + 1) % SELINUX_HIDE_SYM_CACHE_SLOTS;
+    }
+
+    WRITE_ONCE(g_hide_sym_cache_hits, READ_ONCE(g_hide_sym_cache_hits) + 1);
+    return value;
+}
+
+static void hide_sym_cache_reset(void)
+{
+    u32 i;
+
+    for (i = 0; i < SELINUX_HIDE_SYM_CACHE_SLOTS; i++)
+        g_hide_sym_cache[i].valid = false;
+    g_hide_sym_cache_next = 0;
+}
+
+/*
+ * 解析 "user:role:type[:level]"。Android 上 mls_enabled 基本为 0，此时 level
+ * 段（s0/c0 等）不参与 AV 计算，但仍要求它以 ':' 正确分隔，避免把畸形串当成
+ * 合法 context。返回值与上游 string_to_context_struct() 一致：type 是
+ * attribute 时同样视为无效。
+ */
+static bool hide_parse_context(struct policydb *pdb, const char *ctx, size_t len,
+                               struct context *out)
+{
+    const char *seg[4];
+    size_t seg_len[4];
+    u32 seg_count = 0;
+    u32 user;
+    u32 role;
+    u32 type;
+    size_t i;
+    size_t start;
+
+    if (!pdb || !ctx || !len || !out)
+        return false;
+
+    zero_bytes(out, sizeof(*out));
+
+    start = 0;
+    for (i = 0; i <= len; i++) {
+        if (i == len || ctx[i] == ':') {
+            if (seg_count >= 4)
+                return false;   /* 比 u:r:t:s0:c0 还深，格式不认识 */
+            seg[seg_count] = ctx + start;
+            seg_len[seg_count] = i - start;
+            seg_count++;
+            start = i + 1;
+        }
+    }
+
+    if (seg_count < 3)
+        return false;
+
+    user = hide_sym_value_by_name(pdb, SYM_USERS, seg[0], seg_len[0]);
+    if (!user)
+        return false;
+
+    role = hide_sym_value_by_name(pdb, SYM_ROLES, seg[1], seg_len[1]);
+    if (!role)
+        return false;
+
+    type = hide_sym_value_by_name(pdb, SYM_TYPES, seg[2], seg_len[2]);
+    if (!type)
+        return false;
+
+    /*
+     * 上游对 attribute 的 type 一律判无效（typdatum->attribute）。clean policydb
+     * 的 sym_val_to_name 只为 primary type 填名字，所以查得到名字即等价于
+     * primary；这里再兜一层类型属性判断。
+     */
+    if (type <= pdb->symtab[SYM_TYPES].nprim) {
+        struct type_datum *td = (struct type_datum *)flex_array_get_fn(
+            pdb->type_val_to_struct_array, type - 1);
+
+        if (td && td->attribute)
+            return false;
+    }
+
+    out->user = user;
+    out->role = role;
+    out->type = type;
+
+    return true;
+}
+
+static bool hide_class_value_by_name(struct policydb *pdb, const char *name,
+                                     size_t len, u16 *out_class)
+{
+    u32 value;
+
+    if (!pdb || !name || !len || !out_class)
+        return false;
+
+    value = hide_sym_value_by_name(pdb, SYM_CLASSES, name, len);
+    if (!value || value > 0xffff)
+        return false;
+
+    *out_class = (u16)value;
+    return true;
+}
+
+/*
+ * 在 clean policydb 上做一次真实的 AV 计算。等价于上游
+ * security_compute_av_user_with_policy()，但 sid 已由调用方解析成 context，
+ * 因此不需要 sidtab。
+ */
+static bool hide_compute_avd(struct policydb *pdb, const char *scon, size_t scon_len,
+                             const char *tcon, size_t tcon_len, u16 tclass,
+                             struct av_decision *avd)
+{
+    struct context sctx;
+    struct context tctx;
+
+    if (!pdb || !avd)
+        return false;
+
+    if (!hide_parse_context(pdb, scon, scon_len, &sctx))
+        return false;
+    if (!hide_parse_context(pdb, tcon, tcon_len, &tctx))
+        return false;
+
+    /* avd_init() 的初值，seqno 稍后固定为 1。 */
+    avd->allowed = 0;
+    avd->auditallow = 0;
+    avd->auditdeny = 0xffffffff;
+    avd->seqno = 0;
+    avd->flags = 0;
+
+    /* permissive domain 与内核 security_compute_av_user() 保持一致。 */
+    if (ebitmap_get_bit_intel(&pdb->permissive_map, sctx.type))
+        avd->flags |= AVD_FLAGS_PERMISSIVE;
+
+    if (!tclass) {
+        /* 内核语义：class==0 且 allow_unknown 时放行全部权限。 */
+        if (pdb->allow_unknown)
+            avd->allowed = 0xffffffff;
+        avd->seqno = SELINUX_AVD_CLEAN_SEQNO;
+        return true;
+    }
+
+    if (tclass > pdb->symtab[SYM_CLASSES].nprim)
+        return false;
+
+    if (!context_struct_compute_av_intel(pdb, &sctx, &tctx, tclass, avd, NULL))
+        return false;
+
+    /*
+     * 上游把 seqno 固定为 1：stock 开机读到 1，而 load_policy 可能已经把
+     * backup 的 latest_granting 抬高。这里跟随上游，用独立常量而非 status.seq。
+     */
+    avd->seqno = SELINUX_AVD_CLEAN_SEQNO;
+
+    return true;
+}
+
+/* 追加无符号十六进制，返回新的写指针或 NULL（越界）。 */
+static char *hide_append_hex(char *p, char *end, u32 value)
+{
+    static const char digits[] = "0123456789abcdef";
+    char tmp[8];
+    int n = 0;
+
+    do {
+        tmp[n++] = digits[value & 0xf];
+        value >>= 4;
+    } while (value && n < (int)sizeof(tmp));
+
+    while (n > 0) {
+        if (p >= end)
+            return NULL;
+        *p++ = tmp[--n];
+    }
+
+    return p;
+}
+
+/* 追加无符号十进制（seqno 用 %u）。 */
+static char *hide_append_dec(char *p, char *end, u32 value)
+{
+    char tmp[10];
+    int n = 0;
+
+    do {
+        tmp[n++] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value && n < (int)sizeof(tmp));
+
+    while (n > 0) {
+        if (p >= end)
+            return NULL;
+        *p++ = tmp[--n];
+    }
+
+    return p;
+}
+
+/*
+ * 逐字节复刻内核 sel_write_access() 的应答格式 "%x %x %x %x %u %x"。
+ * KPM 不能用 snprintf，故手写；字段顺序与上游 selinux_hide.c 完全一致。
+ */
+static ssize_t hide_format_avd(char *buf, size_t size, const struct av_decision *avd)
+{
+    char *p;
+    char *end;
+
+    if (!buf || !avd)
+        return -EINVAL;
+    if (size < 2)
+        return -EINVAL;
+
+    p = buf;
+    end = buf + size;
+
+    /* allowed */
+    p = hide_append_hex(p, end, avd->allowed);
+    if (!p || p >= end) return -EINVAL;
+    *p++ = ' ';
+    /* perms：内核固定输出 ~0 */
+    p = hide_append_hex(p, end, 0xffffffff);
+    if (!p || p >= end) return -EINVAL;
+    *p++ = ' ';
+    p = hide_append_hex(p, end, avd->auditallow);
+    if (!p || p >= end) return -EINVAL;
+    *p++ = ' ';
+    p = hide_append_hex(p, end, avd->auditdeny);
+    if (!p || p >= end) return -EINVAL;
+    *p++ = ' ';
+    p = hide_append_dec(p, end, avd->seqno);
+    if (!p || p >= end) return -EINVAL;
+    *p++ = ' ';
+    p = hide_append_hex(p, end, avd->flags);
+    if (!p || p >= end) return -EINVAL;
+
+    *p = '\0';
+
+    return (ssize_t)(p - buf);
+}
+
+/*
  * Experimental t7: on 4.19, use the installed clean-policydb computation
  * rather than substituting EINVAL for structurally valid /access requests.
  * Both hooks must actually have installed; otherwise keep previous behavior.
@@ -2562,6 +2975,31 @@ static bool k40_clean_avd_route_ready(void)
            READ_ONCE(g_clean_policydb) &&
            READ_ONCE(g_clean_av_hooked) &&
            READ_ONCE(g_clean_context_lookup_hooked);
+}
+
+/*
+ * KSU selinux_hide 路径是否可用。
+ *
+ * 与 k40_clean_avd_route_ready() 的区别：后者要求把内核 context_struct_compute_av
+ * 重定向到 clean policydb（依赖两个 hook 都装上，且 t10 实验在 4.19 上主动关闭）。
+ * 本路径是**自带**的 AVD 计算：直接在 clean policydb 上跑
+ * context_struct_compute_av_intel()，因此不依赖那两个 hook，也不受
+ * K40_T10_T4_ACCESS_GATE 影响。只要 clean policydb 在位且 flex_array_get
+ * 可用（name->value 反查需要它）即可工作。
+ */
+static bool k40_hide_avd_ready(void)
+{
+    if (READ_ONCE(g_hide_avd_disabled))
+        return false;
+
+    if (!clean_policydb_redirect_supported())
+        return false;
+    if (!READ_ONCE(g_clean_policydb))
+        return false;
+    if (!flex_array_get_fn || !avtab_search_node_fn)
+        return false;
+
+    return true;
 }
 
 static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
@@ -3237,6 +3675,63 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         a->skip_origin = 1;
         a->ret = (ret > 0) ? (uint64_t)ret : (uint64_t)-EINVAL;
         return;
+    }
+
+    /*
+     * KSU selinux_hide 集成：优先在 clean policydb 上算出**真实** av_decision，
+     * 而不是用 -EINVAL 把查询打断。上游 tiann/KernelSU
+     * kernel/feature/selinux_hide.c 的 my_write_access() 正是这个语义 ——
+     * 对 app uid 从不返回 EINVAL，而是用 backup policy 算完再按内核格式写回。
+     *
+     * 这一步直接决定策略 oracle 能否解析出 AVD：返回 EINVAL 时 oracle 只能记
+     * ACCESS_UNAVAILABLE（Hunter 6.72 的 oracleReasons 就是这个形态）。
+     * 因此只要 clean policydb 可用且两个 context 都能在其中解析，就给出真实
+     * 决策；解析不了才回落到下面的 EINVAL，保持既有行为。
+     */
+    if (k40_hide_avd_ready() && sample_len) {
+        struct policydb *pdb = (struct policydb *)READ_ONCE(g_clean_policydb);
+        const char *scon_tok = skip_spaces(sample);
+        const char *tcon_tok = next_token(scon_tok);
+        const char *class_tok = next_token(tcon_tok);
+        struct av_decision clean_avd;
+        u16 tclass = 0;
+        ssize_t ret;
+        bool class_ok;
+
+        class_ok = hide_class_value_by_name(pdb, class_tok,
+                                            token_len(class_tok), &tclass);
+
+        if (class_ok &&
+            hide_compute_avd(pdb, scon_tok, token_len(scon_tok),
+                             tcon_tok, token_len(tcon_tok), tclass, &clean_avd)) {
+            ret = hide_format_avd((char *)a->arg1, size, &clean_avd);
+            if (ret > 0) {
+                n = READ_ONCE(g_clean_access_count) + 1;
+                WRITE_ONCE(g_clean_access_count, n);
+                WRITE_ONCE(g_hide_avd_answer_count, n);
+                slot = n & (ACCESS_PROBE_SLOTS - 1);
+                g_probes[slot].id = n;
+                g_probes[slot].uid = uid;
+                g_probes[slot].node = "access";
+                copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+
+                if (n <= 24)
+                    pr_info("[selinux_hook] KSU HIDE avd /sys/fs/selinux/access #%u uid=%d comm=%s class=%hu allowed=0x%x auditallow=0x%x auditdeny=0x%x seqno=%u flags=0x%x ret=%zd query=\"%s\"\n",
+                            n, uid, current_comm(), tclass, clean_avd.allowed,
+                            clean_avd.auditallow, clean_avd.auditdeny,
+                            clean_avd.seqno, clean_avd.flags, ret, sample);
+
+                a->skip_origin = 1;
+                a->ret = (uint64_t)ret;
+                return;
+            }
+        }
+
+        /*
+         * clean policydb 上算不出（未知 type / class / policydb 不可用）。
+         * 不用猜测值，直接回落到原有 EINVAL 分支，行为与集成前一致。
+         */
+        WRITE_ONCE(g_hide_avd_failed, READ_ONCE(g_hide_avd_failed) + 1);
     }
 
     /*
