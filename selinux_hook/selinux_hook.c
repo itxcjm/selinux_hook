@@ -2695,6 +2695,7 @@ static u32 hide_sym_value_by_name(struct policydb *pdb, u32 sym,
                                   const char *name, size_t len)
 {
     struct flex_array *fa;
+    const char *matched;
     u32 nprim;
     u32 value;
     u32 i;
@@ -2723,16 +2724,22 @@ static u32 hide_sym_value_by_name(struct policydb *pdb, u32 sym,
     if (!fa || !nprim || nprim > SELINUX_HIDE_SYM_SCAN_MAX)
         return 0;
 
+    /*
+     * matched 必须声明在函数作用域：循环结束后还要用它填充缓存条目。
+     */
+    matched = NULL;
     for (value = 1; value <= nprim; value++) {
         const char *sym_name = (const char *)flex_array_get_fn(fa, value - 1);
 
         if (!sym_name)
             continue;
-        if (token_eq_cstr(name, len, sym_name))
+        if (token_eq_cstr(name, len, sym_name)) {
+            matched = sym_name;
             break;
+        }
     }
 
-    if (value > nprim) {
+    if (!matched) {
         WRITE_ONCE(g_hide_sym_cache_misses, READ_ONCE(g_hide_sym_cache_misses) + 1);
         return 0;
     }
@@ -2740,7 +2747,7 @@ static u32 hide_sym_value_by_name(struct policydb *pdb, u32 sym,
     {
         struct hide_sym_cache *c = &g_hide_sym_cache[g_hide_sym_cache_next];
 
-        c->name = sym_name;
+        c->name = matched;
         c->len = len;
         c->value = value;
         c->sym = sym;
