@@ -1,0 +1,35 @@
+name: K40 read-only SELinux AVD KPM
+on:
+  push:
+    paths:
+      - 'k40_avd_audit/**'
+      - '.github/workflows/k40-avd-audit-kpm.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu make file
+      - run: |
+          make -C k40_avd_audit CC=aarch64-linux-gnu-gcc OBJCOPY=aarch64-linux-gnu-objcopy
+          mkdir -p reports
+          file k40_avd_audit/*.kpm | tee reports/file.txt
+          aarch64-linux-gnu-readelf -h k40_avd_audit/*.kpm > reports/elf-header.txt
+          aarch64-linux-gnu-readelf -Ws k40_avd_audit/*.kpm > reports/symbols.txt
+          aarch64-linux-gnu-readelf -rW k40_avd_audit/*.kpm > reports/relocations.txt
+          grep -q AArch64 reports/elf-header.txt
+          sha256sum k40_avd_audit/*.kpm > reports/sha256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k40-selinux-avd-audit-kpm-unverified
+          path: |
+            k40_avd_audit/*.kpm
+            reports/*
+          retention-days: 7

@@ -1,0 +1,3 @@
+K40 SELinux native AVD observer KPM.
+
+Read-only module for Linux 4.19 and KernelPatch. Observes native sel_write_access return values via after-only hook_wrap, collects call/positive/EINVAL/other-error counts and exposes them through KPM_CTL0. Does not change any SELinux decisions, buffers, queries, sepolicy or responses. Use independently of the T11 module when comparing results. This is NOT a root-hiding component. Compile with make -C k40_avd_audit CC=aarch64-linux-gnu-gcc OBJCOPY=aarch64-linux-gnu-objcopy. A successful ARM64 build does not guarantee loader ABI compatibility; retain a recovery path.
