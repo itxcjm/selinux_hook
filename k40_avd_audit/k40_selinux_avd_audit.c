@@ -1,6 +1,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <compiler.h>
 #include <kpmodule.h>
 #include <hook.h>
 #include <ksyms.h>
