@@ -85,6 +85,7 @@ jobs:
           aarch64-linux-gnu-gcc --version | head -1
 
       - name: Compile SukiSU test KPM
+        id: compile
         run: |
           set -o pipefail
           mkdir -p reports
@@ -103,9 +104,26 @@ jobs:
           make -C selinux_hook -j2 TARGET_COMPILE=aarch64-linux-gnu- CC="ccache aarch64-linux-gnu-gcc" 2>&1 | tee reports/compile.log
           ccache --show-stats
 
-      # Upload the compiler diagnostics even when the build fails: a failing
-      # compile never reaches the ELF checks below, so without this the only
-      # visible signal is "exit code 2".
+      # A failing compile never reaches the ELF checks, and the job log needs
+      # authentication. Echo the diagnostics into the run summary so they are
+      # readable straight from the run page.
+      - name: Show compiler diagnostics
+        if: failure()
+        run: |
+          {
+            echo "### Compiler diagnostics"
+            echo
+            echo '#### syntax.log'
+            echo '```'
+            cat reports/syntax.log 2>/dev/null || echo '(missing)'
+            echo '```'
+            echo
+            echo '#### compile.log'
+            echo '```'
+            cat reports/compile.log 2>/dev/null || echo '(missing)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload compiler logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -116,55 +134,6 @@ jobs:
             reports/compile.log
           if-no-files-found: ignore
           retention-days: 7
-
-      # Also commit the diagnostics back onto a scratch branch so they can be
-      # read with a plain `git fetch` when the API and the run log are not
-      # reachable (both are commonly rate limited or auth gated).
-      # The logs are copied to a temp dir first because the checkout below
-      # resets the workspace.
-      - name: Publish diagnostics to a scratch ref
-        if: failure()
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          tmp="$(mktemp -d)"
-          mkdir -p "$tmp/reports"
-          cp -f "$GITHUB_WORKSPACE/reports/syntax.log" "$tmp/reports/" 2>/dev/null || true
-          cp -f "$GITHUB_WORKSPACE/reports/compile.log" "$tmp/reports/" 2>/dev/null || true
-          echo "TMPDIR=$tmp" >> "$GITHUB_ENV"
-          {
-            echo "diagnostics for $GITHUB_SHA"
-            echo "--- files ---"
-            ls -la "$tmp/reports" || true
-          }
-      - name: Checkout for orphan push
-        if: failure()
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          submodules: false
-          persist-credentials: true
-      - name: Push diagnostics to scratch branch
-        if: failure()
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          # Start from an empty tree instead of fighting git rm over submodules.
-          git checkout --orphan k40-ci-diagnostics
-          git reset --hard
-          rm -rf .gitmodules KernelPatch 2>/dev/null || true
-          mkdir -p reports
-          cp -f "$TMPDIR/reports/"* reports/ 2>/dev/null || true
-          git add -A reports
-          if git diff --cached --quiet; then
-            echo "no diagnostics captured"
-            exit 0
-          fi
-          git -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -m "ci: compiler diagnostics for $GITHUB_SHA"
-          git push --force origin k40-ci-diagnostics
 
       - name: Check AArch64 ELF and collect link requirements
         shell: bash
