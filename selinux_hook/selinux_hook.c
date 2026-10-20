@@ -82,7 +82,7 @@ KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
 #define SELINUX_VERSION "1.1.7-fix-beta-6-suki419-t8"
 #endif
-KPM_VERSION("1.1.7-b6-k40-t10");
+KPM_VERSION("1.1.7-b6-k40-t11");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -2400,6 +2400,19 @@ static bool dirtysepolicy_context_should_hide(const char *query)
         return true;
     if (context_token_matches(query, "u:object_r:lsposed_file:s0"))
         return true;
+    /*
+     * K40 T11 control: the dedicated app_zygote probe also submits
+     * file-type names with the process-role spelling "u:r:...:s0".
+     * Match only those three exact probe tokens, without changing other
+     * SELinux context/access decisions or the T10 access gate.
+     */
+    if (context_token_matches(query, "u:r:ksu_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:r:magisk_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:r:lsposed_file:s0"))
+        return true;
+
     if (context_token_matches(query, "u:object_r:xposed_data:s0"))
         return true;
     if (context_token_matches(query, "u:object_r:xposed_file:s0"))
