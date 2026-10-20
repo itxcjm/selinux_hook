@@ -682,6 +682,8 @@ static ssize_t hide_format_avd(char *buf, size_t size, const struct av_decision 
 static bool hide_class_value_by_name(struct policydb *pdb, const char *name,
                                      size_t len, u16 *out_class);
 static bool k40_hide_avd_ready(void);
+static bool token_eq_token(const char *a, size_t a_len, const char *b, size_t b_len);
+static bool token_eq_cstr(const char *a, size_t a_len, const char *b);
 
 /*
  * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
@@ -2439,6 +2441,40 @@ static bool token_eq_lit(const char *token, size_t len, const char *lit)
     return lit[i] == '\0';
 }
 
+/*
+ * 两边都带显式长度的比较。token_eq_lit() 要求 lit 以 NUL 结尾，只能用于源码里的
+ * 字面量；clean policydb 的符号名来自内核 sym_val_to_name[]，不保证 NUL 结尾，
+ * 必须走这个函数，否则会越界读。
+ */
+static bool token_eq_token(const char *a, size_t a_len, const char *b, size_t b_len)
+{
+    size_t i;
+
+    if (!a || !b || a_len != b_len)
+        return false;
+
+    for (i = 0; i < a_len; i++) {
+        if (a[i] != b[i])
+            return false;
+    }
+
+    return true;
+}
+
+/* 同上，但用 C 字符串长度；仅在确认 b 以 NUL 结尾时使用。 */
+static bool token_eq_cstr(const char *a, size_t a_len, const char *b)
+{
+    size_t b_len = 0;
+
+    if (!a || !b)
+        return false;
+
+    while (b[b_len] && b_len < a_len)
+        b_len++;
+
+    return token_eq_token(a, a_len, b, b_len);
+}
+
 static bool context_token_matches(const char *query, const char *lit)
 {
     const char *ctx = skip_spaces(query);
@@ -2676,7 +2712,7 @@ static u32 hide_sym_value_by_name(struct policydb *pdb, u32 sym,
             continue;
         if (c->len != len)
             continue;
-        if (token_eq_lit(name, len, c->name)) {
+        if (token_eq_token(name, len, c->name, len)) {
             WRITE_ONCE(g_hide_sym_cache_hits, READ_ONCE(g_hide_sym_cache_hits) + 1);
             return c->value;
         }
@@ -2692,7 +2728,7 @@ static u32 hide_sym_value_by_name(struct policydb *pdb, u32 sym,
 
         if (!sym_name)
             continue;
-        if (token_eq_lit(name, len, sym_name))
+        if (token_eq_cstr(name, len, sym_name))
             break;
     }
 
