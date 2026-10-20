@@ -105,24 +105,33 @@ jobs:
           ccache --show-stats
 
       # A failing compile never reaches the ELF checks, and the job log needs
-      # authentication. Echo the diagnostics into the run summary so they are
-      # readable straight from the run page.
-      - name: Show compiler diagnostics
+      # authentication. Re-emit each gcc diagnostic as a workflow annotation so
+      # it renders directly on the run page. This needs no extra permissions and
+      # no git push.
+      - name: Annotate compiler diagnostics
         if: failure()
         run: |
-          {
-            echo "### Compiler diagnostics"
-            echo
-            echo '#### syntax.log'
-            echo '```'
-            cat reports/syntax.log 2>/dev/null || echo '(missing)'
-            echo '```'
-            echo
-            echo '#### compile.log'
-            echo '```'
-            cat reports/compile.log 2>/dev/null || echo '(missing)'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -uo pipefail
+          shown=0
+          for log in reports/syntax.log reports/compile.log; do
+            [ -f "$log" ] || continue
+            while IFS= read -r line; do
+              case "$line" in
+                *"error:"*)
+                  echo "::error title=gcc::${line}"
+                  shown=$((shown + 1))
+                  ;;
+              esac
+            done < "$log"
+          done
+          if [ "$shown" -eq 0 ]; then
+            echo "::error title=gcc::no gcc error line captured; see the artifact"
+            tail -n 40 reports/compile.log 2>/dev/null || true
+          fi
+          { echo "### Compiler diagnostics"; echo;
+            echo '```'; cat reports/syntax.log 2>/dev/null; echo '```'; echo;
+            echo '```'; cat reports/compile.log 2>/dev/null; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload compiler logs on failure
         if: failure()
