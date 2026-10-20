@@ -3143,9 +3143,16 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
 
     WRITE_ONCE(g_selinuxfs_layer_alive, true);
 
+    /*
+     * Every hook invocation must explicitly clear its scope-entered marker.
+     * after_sel_write_common() consults data3 on early-return paths as well.
+     * Reusing a stale marker could incorrectly unwind a different nested
+     * clean-eval scope and make subsequent checks inconsistent.
+     */
     a->local.data0 = 0;
     a->local.data1 = 0;
     a->local.data2 = 0;
+    a->local.data3 = 0;
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
@@ -3320,9 +3327,16 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
 
     WRITE_ONCE(g_selinuxfs_layer_alive, true);
 
+    /*
+     * Every hook invocation must explicitly clear its scope-entered marker.
+     * after_sel_write_common() consults data3 on early-return paths as well.
+     * Reusing a stale marker could incorrectly unwind a different nested
+     * clean-eval scope and make subsequent checks inconsistent.
+     */
     a->local.data0 = 0;
     a->local.data1 = 0;
     a->local.data2 = 0;
+    a->local.data3 = 0;
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
@@ -3426,7 +3440,8 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     mode = (u32)a->local.data0;
     id = (u32)a->local.data1;
     slot = (u32)a->local.data2;
-    if (a->local.data3)
+    /* Unwind only a scope that this exact callback entered. */
+    if (a->local.data3 == 1)
         leave_clean_eval_scope();
 
     probe = &g_probes[slot];
